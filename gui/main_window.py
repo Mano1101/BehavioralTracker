@@ -47,11 +47,15 @@ VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".wmv")
 def ask_number(title, prompt, default):
     root = tk.Tk()
     root.withdraw()
-    value = simpledialog.askstring(title, prompt, initialvalue=str(default))
+    value = simpledialog.askstring(title, prompt, initialvalue=str(default) if default != "" else "")
     root.destroy()
 
     if value is None:
         raise SystemExit("Cancelled.")
+
+    if value.strip() == "":
+        messagebox.showerror("Error", "Please enter a value.")
+        raise SystemExit
 
     try:
         return float(value)
@@ -66,7 +70,7 @@ def ask_text(title, prompt, default=""):
     value = simpledialog.askstring(title, prompt, initialvalue=default)
     root.destroy()
 
-    if value is None or value.strip() == "":
+    if value is None:
         return default
 
     return value.strip()
@@ -175,19 +179,40 @@ def select_four_points(frame, window_title="Click the 4 arena corners"):
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
             points.append([x, y])
-            cv2.circle(display, (x, y), 5, (0, 255, 0), -1)
-            cv2.imshow(window_title, display)
 
     display = frame.copy()
-    cv2.imshow(window_title, display)
+    cv2.namedWindow(window_title)
     cv2.setMouseCallback(window_title, on_mouse)
 
-    print("Click the 4 corners of the arena (top-left, top-right, bottom-right, bottom-left).")
-    while len(points) < 4:
-        key = cv2.waitKey(100) & 0xFF
-        if key == 27:  # ESC
+    print("Click the 4 corners of the arena (any order).")
+    print("r = reset, ENTER/SPACE = confirm once 4 points placed, ESC = cancel")
+
+    while True:
+        disp = frame.copy()
+
+        for i, p in enumerate(points):
+            cv2.circle(disp, tuple(p), 6, (0, 0, 255), -1)
+            cv2.putText(disp, str(i + 1), (p[0] + 8, p[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        if len(points) >= 2:
+            for i in range(len(points)):
+                cv2.line(disp, tuple(points[i]), tuple(points[(i + 1) % len(points)]), (0, 255, 255), 1)
+
+        cv2.putText(
+            disp, f"Points: {len(points)}/4  (r=reset, ENTER=confirm, ESC=cancel)",
+            (20, disp.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
+        )
+
+        cv2.imshow(window_title, disp)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == ord("r"):
+            points = []
+        elif key in (13, 32) and len(points) == 4:
+            break
+        elif key == 27:
             cv2.destroyWindow(window_title)
-            return None
+            raise SystemExit("Cancelled arena selection.")
 
     cv2.destroyWindow(window_title)
     return np.array(points, dtype=np.float32)
@@ -199,90 +224,102 @@ def edit_regions_interactive(frame, roi_names):
       {name: [(x0, y0), (x1, y1), ...], ...}
     """
     regions = {name: [] for name in roi_names}
-    current_region = [roi_names[0]] if roi_names else []
-    drawing = [False]
-    temp_points = []
+    active = [roi_names[0]] if roi_names else []
+    dragging = [None]
+    hit_radius = 10
 
     def find_vertex_near(x, y):
         for name, pts in regions.items():
             for j, (px, py) in enumerate(pts):
-                if math.hypot(x - px, y - py) < 10:
+                if math.hypot(x - px, y - py) < hit_radius:
                     return (name, j)
         return None
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal temp_points
-
-        if not current_region:
+        if not active:
             return
 
-        name = current_region[0]
+        name = active[0]
         if event == cv2.EVENT_LBUTTONDOWN:
-            drawing[0] = True
-            temp_points = []
             vertex = find_vertex_near(x, y)
             if vertex:
-                # Start dragging a vertex
-                temp_points = [vertex]
+                dragging[0] = vertex
             else:
-                # Add new point
                 regions[name].append((x, y))
 
-        elif event == cv2.EVENT_MOUSEMOVE and drawing[0]:
-            if temp_points and isinstance(temp_points[0], tuple):
-                name_v, j = temp_points[0]
-                regions[name_v][j] = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if dragging[0]:
+                name_d, j = dragging[0]
+                regions[name_d][j] = (x, y)
 
         elif event == cv2.EVENT_LBUTTONUP:
-            drawing[0] = False
-            temp_points = []
+            dragging[0] = None
 
-    display = frame.copy()
-    cv2.imshow("Edit Regions", display)
-    cv2.setMouseCallback("Edit Regions", on_mouse)
+    cv2.namedWindow("Draw Regions")
+    cv2.setMouseCallback("Draw Regions", on_mouse)
 
-    print(f"Draw polygons for: {', '.join(roi_names)}")
-    print("  - Left-click to add/drag vertices")
-    print("  - Keys: [1-9] switch region, [d] delete last vertex, [c] clear region, [Enter] done")
+    print("\nDraw ALL regions on one view:")
+    print("  1-9 = pick which region new clicks add to")
+    print("  click = add a point to the active region, OR drag an existing point")
+    print("  z = undo the active region's last point")
+    print("  ENTER = finish (every region needs 3+ points)")
+    print("  ESC = cancel")
+
+    key_to_name = {str(i + 1): name for i, name in enumerate(roi_names[:9])}
 
     while True:
-        display = frame.copy()
-        color_idx = 0
-        for name, pts in regions.items():
+        base = frame.copy()
+        overlay = frame.copy()
+
+        for i, name in enumerate(roi_names):
+            pts = regions[name]
+            color = tuple(ROI_COLORS[i % len(ROI_COLORS)])
+            if len(pts) >= 3:
+                cv2.fillPoly(overlay, [np.array(pts, dtype=np.int32)], color)
+
+        disp = cv2.addWeighted(overlay, 0.25, base, 0.75, 0)
+
+        for i, name in enumerate(roi_names):
+            pts = regions[name]
+            color = tuple(ROI_COLORS[i % len(ROI_COLORS)])
+            if len(pts) >= 2:
+                cv2.polylines(disp, [np.array(pts, dtype=np.int32)], len(pts) >= 3, color, 3 if name == active[0] else 2)
+
+            for p in pts:
+                r = 6 if name == active[0] else 4
+                cv2.circle(disp, p, r, color, -1)
+                cv2.circle(disp, p, r, (255, 255, 255), 1)
+
             if pts:
-                color = tuple(ROI_COLORS[color_idx % len(ROI_COLORS)])
-                pts_arr = np.array(pts, dtype=np.int32)
-                cv2.polylines(display, [pts_arr], False, color, 2)
-                for px, py in pts:
-                    cv2.circle(display, (px, py), 3, color, -1)
-            color_idx += 1
+                cx = int(np.mean([p[0] for p in pts]))
+                cy = int(np.mean([p[1] for p in pts]))
+                cv2.putText(disp, name, (cx - 25, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        if current_region:
-            cv2.putText(
-                display, f"Current: {current_region[0]}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
-            )
+        title = "Draw Regions: " + ", ".join(roi_names)
+        key_hint = "  ".join(f"[{k}]{v}" for k, v in key_to_name.items())
+        status = f"Active: {active[0]} ({len(regions[active[0]])} pts)  {key_hint}"
+        cv2.putText(disp, status, (10, disp.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(disp, "[z]undo  [ENTER]finish (3+ pts each)  [ESC]cancel", (10, disp.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        cv2.imshow("Edit Regions", display)
-        key = cv2.waitKey(100) & 0xFF
+        cv2.imshow("Draw Regions", disp)
+        key = cv2.waitKey(20) & 0xFF
+        key_char = chr(key) if 0 <= key < 256 else ""
 
-        if key == 13:  # Enter
-            break
-        elif 49 <= key <= 57:  # 1-9
-            idx = key - 49
-            if idx < len(roi_names):
-                current_region = [roi_names[idx]]
-        elif key == ord("d"):
-            if current_region and regions[current_region[0]]:
-                regions[current_region[0]].pop()
-        elif key == ord("c"):
-            if current_region:
-                regions[current_region[0]] = []
+        if key_char in key_to_name:
+            active[0] = key_to_name[key_char]
+        elif key_char == "z":
+            if active and regions[active[0]]:
+                regions[active[0]].pop()
+        elif key == 13:  # ENTER
+            if all(len(regions[name]) >= 3 for name in roi_names):
+                break
+            else:
+                messagebox.showwarning("Warning", "Every region needs at least 3 points.")
         elif key == 27:  # ESC
-            cv2.destroyWindow("Edit Regions")
-            return None
+            cv2.destroyWindow("Draw Regions")
+            raise SystemExit("Cancelled region editing.")
 
-    cv2.destroyWindow("Edit Regions")
+    cv2.destroyWindow("Draw Regions")
     return regions
 
 
@@ -293,19 +330,23 @@ def select_object_point(frame, name):
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(points) == 0:
             points.append([x, y])
-            cv2.circle(display, (x, y), 8, (0, 255, 0), -1)
-            cv2.imshow(f"Select {name}", display)
 
-    display = frame.copy()
-    cv2.imshow(f"Select {name}", display)
+    cv2.namedWindow(f"Select {name}")
     cv2.setMouseCallback(f"Select {name}", on_mouse)
 
     print(f"Click to mark the center of '{name}'.")
+
     while len(points) == 0:
-        key = cv2.waitKey(100) & 0xFF
-        if key == 27:  # ESC
+        disp = frame.copy()
+        if points:
+            cv2.circle(disp, tuple(points[0]), 8, (0, 255, 0), -1)
+        cv2.putText(disp, f"Click to mark center of '{name}'  (ESC=cancel)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.imshow(f"Select {name}", disp)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == 27:
             cv2.destroyWindow(f"Select {name}")
-            return None
+            raise SystemExit(f"Cancelled selection of '{name}'.")
 
     cv2.destroyWindow(f"Select {name}")
     return tuple(points[0])
@@ -317,20 +358,28 @@ def select_two_points(frame, window_title="Click 2 points of known distance"):
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
             points.append([x, y])
-            cv2.circle(display, (x, y), 5, (0, 255, 0), -1)
-            cv2.putText(display, str(len(points)), (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.imshow(window_title, display)
 
-    display = frame.copy()
-    cv2.imshow(window_title, display)
+    cv2.namedWindow(window_title)
     cv2.setMouseCallback(window_title, on_mouse)
 
-    print("Click 2 points of known distance (e.g., two ends of a ruler, or opposite walls).")
+    print("Click 2 points of known distance (e.g., opposite corners of a known-sized object).")
+
     while len(points) < 2:
-        key = cv2.waitKey(100) & 0xFF
-        if key == 27:  # ESC
+        disp = frame.copy()
+        for i, p in enumerate(points):
+            cv2.circle(disp, tuple(p), 5, (0, 255, 0), -1)
+            cv2.putText(disp, str(i + 1), (p[0] + 10, p[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        if len(points) == 2:
+            cv2.line(disp, tuple(points[0]), tuple(points[1]), (0, 255, 255), 2)
+
+        cv2.putText(disp, f"Points: {len(points)}/2  (ESC=cancel)", (10, disp.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.imshow(window_title, disp)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == 27:
             cv2.destroyWindow(window_title)
-            return None
+            raise SystemExit("Cancelled distance calibration.")
 
     cv2.destroyWindow(window_title)
     return np.array(points, dtype=np.float32)
@@ -349,7 +398,7 @@ def get_scale_factor(frame):
     print(f"Pixel distance: {pixel_distance:.1f}")
 
     try:
-        physical_distance = ask_number("Scale calibration", "Enter the known distance (in cm):", 10.0)
+        physical_distance = ask_number("Scale calibration", "Enter the known distance (in cm):", "")
     except SystemExit:
         return None
 
@@ -425,18 +474,15 @@ def calibrate(video_path, include_interactions=True):
         if pts is not None:
             state["arena_pts"] = pts
             state["matrix"] = compute_perspective_transform(pts)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            _, frame = cap.read()
-            state["first_frame"] = frame
 
     def step_zone_names(state):
-        """Ask user for zone (ROI) names."""
-        prompt = "Enter ROI names (comma-separated, e.g., 'zone1, zone2'):"
+        """Ask user for zone (ROI) names (no prefilled defaults)."""
+        prompt = "Enter ROI/zone names (comma-separated, e.g., 'zone1, zone2'):"
         names_str = ask_text("Zones", prompt, "")
         if names_str.strip():
             state["roi_names"] = [n.strip() for n in names_str.split(",") if n.strip()]
         else:
-            messagebox.showwarning("Warning", "No ROI names entered.")
+            messagebox.showwarning("Warning", "No zone names entered.")
 
     def step_zone_polygons(state):
         """Draw polygons for each zone."""
@@ -447,7 +493,7 @@ def calibrate(video_path, include_interactions=True):
 
     def step_object_names(state):
         """Ask user for object names."""
-        prompt = "Enter object names (comma-separated, e.g., 'object1, object2'):"
+        prompt = "Enter object names (comma-separated, or leave blank):"
         names_str = ask_text("Objects", prompt, "")
         if names_str.strip():
             state["object_names"] = [n.strip() for n in names_str.split(",") if n.strip()]
@@ -459,9 +505,12 @@ def calibrate(video_path, include_interactions=True):
         if not state["object_names"]:
             return
         for name in state["object_names"]:
-            pt = select_object_point(state["first_frame"], name)
-            if pt:
-                state["object_points"][name] = {"center": pt, "radius": 50}
+            try:
+                pt = select_object_point(state["first_frame"], name)
+                if pt:
+                    state["object_points"][name] = {"center": pt, "radius": 50}
+            except SystemExit:
+                break
 
     def step_behavior_names(state):
         """Ask user for behavior names (if applicable)."""
@@ -474,28 +523,31 @@ def calibrate(video_path, include_interactions=True):
 
     def step_detection_settings(state):
         """Tune detection parameters."""
-        state["detection_threshold"] = ask_number("Detection", "Diff threshold (0-255):", 20)
-        state["min_area"] = ask_number("Detection", "Min blob area (pixels):", 50)
-        state["max_area"] = ask_number("Detection", "Max blob area (pixels):", 5000)
-        state["morph_kernel"] = int(ask_number("Detection", "Morphology kernel (odd):", 5))
+        try:
+            state["detection_threshold"] = ask_number("Detection", "Diff threshold (0-255):", "20")
+            state["min_area"] = ask_number("Detection", "Min blob area (pixels):", "50")
+            state["max_area"] = ask_number("Detection", "Max blob area (pixels):", "5000")
+            state["morph_kernel"] = int(ask_number("Detection", "Morphology kernel (odd):", "5"))
+        except SystemExit:
+            pass
 
     def step_window_weighting(state):
         """Ask for baseline window."""
-        state["window_baseline_s"] = ask_number("Baseline", "Baseline window (seconds):", 10.0)
+        try:
+            state["window_baseline_s"] = ask_number("Baseline", "Baseline window (seconds):", "10.0")
+        except SystemExit:
+            pass
 
     def step_scale_calibration(state):
         """Optional: calibrate pixel -> cm conversion."""
         do_scale = ask_yes_no("Scale", "Calibrate scale factor (pixels to cm)?")
         if do_scale:
-            scale = get_scale_factor(state["first_frame"])
-            if scale:
-                state["scale_factor"] = scale
-
-    def step_preview_samples(state):
-        """Show sample frames with detected objects."""
-        if not state["arena_pts"] is None:
-            print("Running preview detection...")
-            # This would call a preview function
+            try:
+                scale = get_scale_factor(state["first_frame"])
+                if scale:
+                    state["scale_factor"] = scale
+            except SystemExit:
+                pass
 
     steps = [
         ("Time Window", step_time_window),
@@ -578,9 +630,12 @@ def recalibrate_spatial_only(video_path, base_setup):
             return
         state["object_points"] = {}
         for name in state["object_names"]:
-            pt = select_object_point(state["first_frame"], name)
-            if pt:
-                state["object_points"][name] = {"center": pt, "radius": 50}
+            try:
+                pt = select_object_point(state["first_frame"], name)
+                if pt:
+                    state["object_points"][name] = {"center": pt, "radius": 50}
+            except SystemExit:
+                break
 
     steps = [
         ("Arena", step_arena),
