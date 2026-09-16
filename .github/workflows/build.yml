@@ -38,17 +38,8 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build Windows exe
-        if: runner.os == 'Windows'
-        run: pyinstaller --onefile --windowed --name BehavioralTracker --icon=resources/icon.ico --add-data "resources;resources" --collect-all cv2 --collect-all matplotlib --collect-all scipy main.py
-
-      - name: Build Linux binary
-        if: runner.os == 'Linux'
-        run: pyinstaller --onefile --name BehavioralTracker --add-data "resources:resources" --collect-all cv2 --collect-all matplotlib --collect-all scipy main.py
-
-      - name: Build macOS app bundle
-        if: runner.os == 'macOS'
-        run: pyinstaller --windowed --name BehavioralTracker --icon=resources/icon.icns --add-data "resources:resources" --collect-all cv2 --collect-all matplotlib --collect-all scipy main.py
+      - name: Build platform binary using the committed PyInstaller spec
+        run: pyinstaller BehavioralTracker.spec
 
       - name: Zip the macOS app (so it's one downloadable file)
         if: runner.os == 'macOS'
