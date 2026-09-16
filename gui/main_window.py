@@ -544,7 +544,7 @@ def calibrate(video_path, include_interactions=True):
         state["first_frame"] = first_frame
 
     def step_zone_names(state):
-        default = ",".join(state.get("roi_names", ["Light", "Dark"]))
+        default = ",".join(state.get("roi_names", []))
         names_raw = ask_text(
             "Zone names",
             "Enter zone/ROI names, comma-separated -- as many as this paradigm needs\n"
@@ -570,24 +570,16 @@ def calibrate(video_path, include_interactions=True):
         state["object_names"] = [n.strip() for n in names_raw.split(",") if n.strip()]
 
     def step_object_points(state):
-        object_points = {}
-        for name in state["object_names"]:
-            center = select_object_point(state["first_frame"], name)
-            radius = ask_number(
-                f"Interaction radius: {name}",
-                f"Interaction radius around '{name}', in pixels\n"
-                "(how close the tracked point must get to count as an approach):",
-                30
-            )
-            object_points[name] = {"center": center, "radius": radius}
-        state["object_points"] = object_points
+        state["object_points"] = edit_regions_interactive(
+            state["first_frame"], state["object_names"]
+        ) if state["object_names"] else {}
 
     def step_behavior_names(state):
         if not state.get("object_names"):
             state["behavior_names"] = []
             return
 
-        default = ",".join(state.get("behavior_names", ["Sniffing", "Touching", "Climbing"]))
+        default = ",".join(state.get("behavior_names", []))
         names_raw = ask_text(
             "Interaction/behavior types",
             "Behavior labels to choose from when tagging an interaction bout,\n"
@@ -751,14 +743,8 @@ def recalibrate_spatial_only(video_path, base_setup):
         state["roi_points"] = edit_regions_interactive(state["first_frame"], base_setup["roi_names"])
 
     def step_object_points(state):
-        object_points = {}
-        for name in base_setup.get("object_names", []):
-            center = select_object_point(state["first_frame"], name)
-            radius = ask_number(
-                f"Interaction radius: {name}", f"Interaction radius around '{name}', in pixels:", 30
-            )
-            object_points[name] = {"center": center, "radius": radius}
-        state["object_points"] = object_points
+        names = base_setup.get("object_names", [])
+        state["object_points"] = edit_regions_interactive(state["first_frame"], names) if names else {}
 
     steps = [
         ("Arena corners", step_arena),
@@ -999,6 +985,7 @@ class TrackerApp:
         self.pending_matrix = None
         self.pending_warp_w = None
         self.pending_warp_h = None
+        self.pending_crop_corners = None
         self.pending_roi_points = {}
         self.pending_object_points = {}
         self.pending_mask_points = []
@@ -1012,17 +999,19 @@ class TrackerApp:
         self._op = None
         self.active_tool = None
 
-        # Remembered field values -- carried over whenever the setup panel
-        # rebuilds (switching Analysis Type, adding a video, etc.) so
-        # typing in a custom time window or zone names doesn't get wiped
-        # back to the hardcoded defaults. Only the "Reset" buttons clear
-        # these back to the defaults below.
-        self._remembered_start = "0"
-        self._remembered_end = "600"
-        self._remembered_roi_names = "Light,Dark"
+        # ---- Persistent memory (cleared ONLY by Reset All) ----
+        # Stores every user-entered value so switching analysis types,
+        # adding/removing videos, re-editing calibration steps, etc.
+        # never loses user progress. Only "Reset All" clears this dict.
+        self._memory = {}
+
         self._last_built_mode = None
 
-        root.title("BehavioralTracker")
+        APP_VERSION = "v1.8"
+        APP_BRAND = "BehavioralTracker"
+        APP_COPYRIGHT = f"© 2025 {APP_BRAND}"
+
+        root.title(APP_BRAND)
         root.geometry("1550x980")
         root.minsize(1200, 760)
         root.resizable(True, True)
@@ -1035,14 +1024,20 @@ class TrackerApp:
         except Exception:
             pass
 
-        # ---- color palette + ttk styling ----
+        # ---- color palette + ttk styling (commercial, clean) ----
         BG = "#f7f7f7"
+        SURFACE = "#ffffff"
         HEADER_BG = "#1f2937"
         ACCENT = "#2f6fb0"
         ACCENT_DARK = "#24557f"
-        GREEN = "#4caf7d"
+        ACCENT_LIGHT = "#e8f0fb"
+        SUCCESS = "#4caf7d"
+        DANGER = "#b0392f"
+        DANGER_DARK = "#8f2e26"
         TEXT = "#1a1a1a"
+        TEXT_SOFT = "#4b5563"
         MUTED = "#666666"
+        BORDER = "#c9c9c9"
 
         root.configure(bg=BG)
 
@@ -1055,13 +1050,13 @@ class TrackerApp:
         style.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", 9))
         style.configure("TFrame", background=BG)
         style.configure("TLabel", background=BG, foreground=TEXT)
-        style.configure("TCheckbutton", background=BG, foreground=TEXT)
-        style.configure("TRadiobutton", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+        style.configure("TCheckbutton", background=BG, foreground=TEXT, focuscolor="none")
+        style.configure("TRadiobutton", background=BG, foreground=TEXT, font=("Segoe UI", 10), focuscolor="none")
         style.map("TRadiobutton", foreground=[("selected", ACCENT)],
                   font=[("selected", ("Segoe UI", 10, "bold"))])
-        style.configure("TLabelframe", background=BG, bordercolor="#c9c9c9")
+        style.configure("TLabelframe", background=BG, bordercolor=BORDER)
         style.configure("TLabelframe.Label", background=BG, foreground=TEXT, font=("Segoe UI", 10, "bold"))
-        style.configure("TEntry", fieldbackground="white")
+        style.configure("TEntry", fieldbackground=SURFACE)
 
         style.configure("Header.TFrame", background=HEADER_BG)
         style.configure("HeaderTitle.TLabel", background=HEADER_BG, foreground="white",
@@ -1072,8 +1067,9 @@ class TrackerApp:
         style.configure("Accent.TButton", background=ACCENT, foreground="white", font=("Segoe UI", 10, "bold"))
         style.map("Accent.TButton", background=[("active", ACCENT_DARK)], foreground=[("active", "white")])
 
-        style.configure("Start.TButton", background=ACCENT, foreground="white", font=("Segoe UI", 12, "bold"))
-        style.map("Start.TButton", background=[("active", ACCENT_DARK)], foreground=[("active", "white")])
+        style.configure("Start.TButton", background=SUCCESS, foreground="white",
+                        font=("Segoe UI", 12, "bold"))
+        style.map("Start.TButton", background=[("active", "#3f9468")], foreground=[("active", "white")])
 
         style.configure("Tool.TButton", padding=6, font=("Segoe UI", 9))
         style.configure("ToolActive.TButton", padding=6, font=("Segoe UI", 9, "bold"),
@@ -1082,19 +1078,26 @@ class TrackerApp:
 
         style.configure("Reset.TButton", padding=2, font=("Segoe UI", 8))
         style.configure("Danger.TButton", padding=4, font=("Segoe UI", 9, "bold"),
-                        background="#b0392f", foreground="white")
-        style.map("Danger.TButton", background=[("active", "#8f2e26")], foreground=[("active", "white")])
+                        background=DANGER, foreground="white")
+        style.map("Danger.TButton", background=[("active", DANGER_DARK)], foreground=[("active", "white")])
 
-        style.configure("Green.Horizontal.TProgressbar", background=GREEN, troughcolor="#e2e2e2")
+        style.configure("Footer.TFrame", background="#ececec")
+        style.configure("Footer.TLabel", background="#ececec", foreground=TEXT_SOFT, font=("Segoe UI", 8))
+        style.configure("FooterAccent.TLabel", background="#ececec", foreground=ACCENT, font=("Segoe UI", 8, "bold"))
 
-        self._palette = {"BG": BG, "HEADER_BG": HEADER_BG, "ACCENT": ACCENT,
-                         "ACCENT_DARK": ACCENT_DARK, "GREEN": GREEN, "TEXT": TEXT, "MUTED": MUTED}
+        style.configure("Green.Horizontal.TProgressbar", background=SUCCESS, troughcolor="#e2e2e2")
 
-        # ---- header bar ----
+        self._palette = {"BG": BG, "SURFACE": SURFACE, "HEADER_BG": HEADER_BG, "ACCENT": ACCENT,
+                         "ACCENT_DARK": ACCENT_DARK, "ACCENT_LIGHT": ACCENT_LIGHT,
+                         "SUCCESS": SUCCESS, "DANGER": DANGER, "TEXT": TEXT, "TEXT_SOFT": TEXT_SOFT,
+                         "MUTED": MUTED, "BORDER": BORDER, "APP_BRAND": APP_BRAND,
+                         "APP_VERSION": APP_VERSION}
+
+        # ---- header bar (matches screenshot: B badge + single title + Reset All right) ----
         header = ttk.Frame(root, style="Header.TFrame", padding=(14, 10))
         header.pack(fill="x")
         ttk.Label(header, text="B", style="HeaderBadge.TLabel", width=2).pack(side="left")
-        ttk.Label(header, text="BehavioralTracker", style="HeaderTitle.TLabel").pack(side="left", padx=(10, 0))
+        ttk.Label(header, text=APP_BRAND, style="HeaderTitle.TLabel").pack(side="left", padx=(10, 0))
         ttk.Button(header, text="Reset All", style="Danger.TButton",
                   command=self.on_reset_all).pack(side="right")
 
@@ -1128,6 +1131,15 @@ class TrackerApp:
 
         self._build_setup_body()
 
+        # ---- footer status bar (subtle) ----
+        footer = tk.Frame(root, background="#ececec", height=24)
+        footer.pack(fill="x", side="bottom")
+        footer.pack_propagate(False)
+        tk.Label(footer, text=APP_COPYRIGHT, background="#ececec",
+                 foreground=TEXT_SOFT, font=("Segoe UI", 8), padx=14).pack(side="left")
+        tk.Label(footer, text=APP_VERSION, background="#ececec",
+                 foreground=ACCENT, font=("Segoe UI", 8, "bold"), padx=14).pack(side="right")
+
     # ------------------------------------------------------------------
     # Analysis type switching + setup-body construction
     # ------------------------------------------------------------------
@@ -1138,27 +1150,117 @@ class TrackerApp:
         self.analysis_type = value
         for val, btn in self.analysis_type_buttons.items():
             btn.configure(style="Accent.TButton" if val == value else "Tool.TButton")
+        self._save_all_to_memory(include_calibration=True)
         self._reset_calibration_state()
         self._build_setup_body()
 
+    # ---------------- Memory helpers (cleared ONLY by Reset All) ----------------
+    def _mem_get(self, key, default=""):
+        return self._memory.get(key, default)
+
+    def _mem_save_entry(self, attr_name, mem_key=None):
+        if mem_key is None:
+            mem_key = attr_name
+        widget = getattr(self, attr_name, None)
+        if widget is None:
+            return
+        try:
+            self._memory[mem_key] = widget.get()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _mem_save_var(self, attr_name, mem_key=None):
+        if mem_key is None:
+            mem_key = attr_name
+        var = getattr(self, attr_name, None)
+        if var is None:
+            return
+        try:
+            self._memory[mem_key] = var.get()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _save_all_to_memory(self, include_calibration=True):
+        for attr_name in (
+            "start_entry", "end_entry", "roi_names_entry", "object_names_entry",
+            "output_size_entry", "bg_samples_entry", "threshold_entry",
+            "min_area_entry", "max_area_entry", "max_jump_entry",
+            "window_size_entry", "window_weight_entry",
+            "real_distance_entry", "units_entry", "preview_samples_entry",
+            "color_mode_var", "use_window_var", "use_zone_threshold_var",
+            "reject_shadows_var", "loc_var", "interact_var", "entries_var",
+            "altern_var", "all_var", "num_animals",
+            "loco_thresh_entry", "rear_thresh_entry", "groom_thresh_entry",
+            "immobile_thresh_entry", "min_bout_entry",
+            "behavior_rearing_var", "behavior_grooming_var",
+            "behavior_locomotion_var", "behavior_immobile_var",
+            "behavior_all_var",
+        ):
+            if attr_name == "num_animals":
+                if hasattr(self, "num_animals"):
+                    self._memory["num_animals"] = self.num_animals
+            elif attr_name.endswith("_var"):
+                self._mem_save_var(attr_name)
+            else:
+                self._mem_save_entry(attr_name)
+        if include_calibration:
+            for k in ("pending_use_crop", "pending_matrix", "pending_warp_w",
+                      "pending_warp_h", "pending_crop_corners", "pending_roi_points",
+                      "pending_object_points", "pending_mask_points",
+                      "pending_scale_factor", "pending_scale_unit"):
+                if hasattr(self, k):
+                    self._memory[k] = getattr(self, k)
+
+    @property
+    def _remembered_start(self):
+        return self._mem_get("start_entry", "")
+
+    @_remembered_start.setter
+    def _remembered_start(self, value):
+        self._memory["start_entry"] = value
+
+    @property
+    def _remembered_end(self):
+        return self._mem_get("end_entry", "")
+
+    @_remembered_end.setter
+    def _remembered_end(self, value):
+        self._memory["end_entry"] = value
+
+    @property
+    def _remembered_roi_names(self):
+        return self._mem_get("roi_names_entry", "")
+
+    @_remembered_roi_names.setter
+    def _remembered_roi_names(self, value):
+        self._memory["roi_names_entry"] = value
+
+    def _entry_or_default(self, attr_name, default):
+        mem_val = self._mem_get(attr_name, None)
+        if mem_val not in (None, ""):
+            return str(mem_val)
+        return str(default)
+
+    def _var_or_default(self, attr_name, default):
+        mem_val = self._mem_get(attr_name, None)
+        if mem_val is not None:
+            return bool(mem_val)
+        return default
+
     def _build_setup_body(self):
-        # Capture whatever's currently in these fields before the rebuild
-        # destroys the widgets, so switching Analysis Type (or re-adding a
-        # video) doesn't silently wipe custom values back to the defaults.
-        if hasattr(self, "start_entry"):
-            self._remembered_start = self.start_entry.get()
-        if hasattr(self, "end_entry"):
-            self._remembered_end = self.end_entry.get()
-        # roi_names_entry exists even in Behavior mode (a harmless unpacked
-        # stand-in for code that references it generically) -- only capture
-        # it when the panel we're LEAVING actually had a real zone-names
-        # field, or leaving Behavior mode would overwrite a good remembered
-        # value with that stand-in's empty content.
-        if getattr(self, "roi_names_entry", None) is not None and self._last_built_mode != "behavior":
-            self._remembered_roi_names = self.roi_names_entry.get()
+        self._save_all_to_memory(include_calibration=False)
 
         for child in self.body_container.winfo_children():
             child.destroy()
+
+        # Restore calibration state from memory (the drawing tools populate
+        # pending_* fields directly, so they survive any rebuild).
+        for k in ("pending_use_crop", "pending_matrix", "pending_warp_w",
+                  "pending_warp_h", "pending_crop_corners", "pending_roi_points",
+                  "pending_object_points", "pending_mask_points",
+                  "pending_scale_factor", "pending_scale_unit"):
+            if k in self._memory:
+                setattr(self, k, self._memory[k])
 
         if self.analysis_type == "behavior":
             self._build_behavior_setup(self.body_container)
@@ -1224,21 +1326,23 @@ class TrackerApp:
         ttk.Label(time_frame, text="Object names (only used if Interaction Tracking is on):",
                   font=("Segoe UI", 7)).pack(anchor="w", pady=(6, 0))
         self.object_names_entry = ttk.Entry(time_frame)
+        self.object_names_entry.insert(0, self._entry_or_default("object_names_entry", ""))
         self.object_names_entry.pack(fill="x")
 
         out_frame = ttk.Frame(left, padding=(0, 8, 0, 0))
         out_frame.pack(fill="x")
         ttk.Label(out_frame, text="Video output size:").pack(side="left")
         self.output_size_entry = ttk.Entry(out_frame, width=12)
+        self.output_size_entry.insert(0, self._entry_or_default("output_size_entry", ""))
         self.output_size_entry.pack(side="left", padx=(6, 0))
 
         analysis_frame = ttk.LabelFrame(left, text="Analysis", padding=8)
         analysis_frame.pack(fill="x", pady=(10, 0))
-        self.loc_var = tk.BooleanVar(value=True)
-        self.interact_var = tk.BooleanVar(value=False)
-        self.entries_var = tk.BooleanVar(value=False)
-        self.altern_var = tk.BooleanVar(value=False)
-        self.all_var = tk.BooleanVar(value=False)
+        self.loc_var = tk.BooleanVar(value=self._var_or_default("loc_var", True))
+        self.interact_var = tk.BooleanVar(value=self._var_or_default("interact_var", False))
+        self.entries_var = tk.BooleanVar(value=self._var_or_default("entries_var", False))
+        self.altern_var = tk.BooleanVar(value=self._var_or_default("altern_var", False))
+        self.all_var = tk.BooleanVar(value=self._var_or_default("all_var", False))
 
         if mode == "standard":
             ttk.Checkbutton(analysis_frame, text="Location Tracking (always on)", variable=self.loc_var,
@@ -1260,11 +1364,11 @@ class TrackerApp:
         animals_row.pack(fill="x", pady=(8, 0))
         ttk.Label(animals_row, text="Animals in frame:").pack(side="left")
         default_n = 2 if mode == "multi_mouse" else 1
-        self.num_animals = default_n
+        self.num_animals = int(self._mem_get("num_animals", default_n))
         self.num_animals_buttons = {}
         for n in (1, 2, 3):
             b = ttk.Button(animals_row, text=str(n), width=3,
-                           style=("Accent.TButton" if n == default_n else "Tool.TButton"),
+                           style=("Accent.TButton" if n == self.num_animals else "Tool.TButton"),
                            command=lambda n=n: self.on_num_animals(n))
             b.pack(side="left", padx=(6, 0))
             self.num_animals_buttons[n] = b
@@ -1327,7 +1431,7 @@ class TrackerApp:
 
         color_frame = ttk.LabelFrame(settings_frame, text="Analysis Color Mode", padding=8)
         color_frame.pack(fill="x", pady=(0, 10))
-        self.color_mode_var = tk.StringVar(value="gray")
+        self.color_mode_var = tk.StringVar(value=self._entry_or_default("color_mode_var", "gray"))
         ttk.Radiobutton(color_frame, text="Grayscale (default -- faster)",
                         variable=self.color_mode_var, value="gray").pack(anchor="w")
         ttk.Radiobutton(color_frame, text="RGB / Color", variable=self.color_mode_var,
@@ -1336,39 +1440,46 @@ class TrackerApp:
                   "floor but brightness doesn't)", font=("Segoe UI", 7), foreground=MUTED,
                   wraplength=255, justify="left").pack(anchor="w", padx=(18, 0))
 
-        def setting_field(parent, label_text, default):
+        def setting_field(parent, label_text, attr_name, default):
             ttk.Label(parent, text=label_text, font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 0))
             e = ttk.Entry(parent)
-            e.insert(0, str(default))
+            e.insert(0, self._entry_or_default(attr_name, default))
             e.pack(fill="x")
             return e
 
         default_min_area = 15 if mode == "standard" else 150
         default_max_area = 5000 if mode == "standard" else 1200
 
-        self.bg_samples_entry = setting_field(settings_frame, "Background samples (default 100)", 100)
-        self.threshold_entry = setting_field(settings_frame, "Difference threshold (start 25)", 25)
-        self.min_area_entry = setting_field(settings_frame, "Min mouse area, px (keep LOW)", default_min_area)
+        self.bg_samples_entry = setting_field(settings_frame, "Background samples (default 100)", "bg_samples_entry", 100)
+        self.threshold_entry = setting_field(settings_frame, "Difference threshold (start 25)", "threshold_entry", 25)
+        self.min_area_entry = setting_field(settings_frame, "Min mouse area, px (keep LOW)", "min_area_entry", default_min_area)
         self.max_area_entry = setting_field(
             settings_frame,
             "Max object area, px" if mode == "standard" else "Max object area, px (~1 mouse; tune this)",
-            default_max_area
+            "max_area_entry", default_max_area
         )
-        self.max_jump_entry = setting_field(settings_frame, "Max movement / frame, px", 100)
+        self.max_jump_entry = setting_field(settings_frame, "Max movement / frame, px", "max_jump_entry", 100)
 
-        self.use_window_var = tk.BooleanVar(value=False)
-        self.use_zone_threshold_var = tk.BooleanVar(value=False)
+        self.use_window_var = tk.BooleanVar(value=self._var_or_default("use_window_var", False))
+        self.use_zone_threshold_var = tk.BooleanVar(value=self._var_or_default("use_zone_threshold_var", False))
+        self.reject_shadows_var = tk.BooleanVar(value=self._var_or_default("reject_shadows_var", False))
         self.real_distance_entry = None
         self.units_entry = None
 
         if mode == "standard":
             ttk.Checkbutton(settings_frame, text="Prior-position weighting", variable=self.use_window_var
                             ).pack(anchor="w", pady=(8, 0))
-            self.window_size_entry = setting_field(settings_frame, "  window size, px", 120)
-            self.window_weight_entry = setting_field(settings_frame, "  window weight (0-1)", 0.5)
+            self.window_size_entry = setting_field(settings_frame, "  window size, px", "window_size_entry", 120)
+            self.window_weight_entry = setting_field(settings_frame, "  window weight (0-1)", "window_weight_entry", 0.5)
 
             ttk.Checkbutton(settings_frame, text="Per-zone adaptive threshold", variable=self.use_zone_threshold_var
                             ).pack(anchor="w", pady=(8, 0))
+
+            ttk.Checkbutton(settings_frame, text="Reject shadows", variable=self.reject_shadows_var
+                            ).pack(anchor="w", pady=(8, 0))
+            ttk.Label(settings_frame, text="(if the tracker keeps grabbing the animal's shadow "
+                      "instead of its body, try this)", font=("Segoe UI", 7),
+                      foreground=MUTED, wraplength=255, justify="left").pack(anchor="w", padx=(18, 0))
         else:
             self.window_size_entry = None
             self.window_weight_entry = None
@@ -1380,27 +1491,36 @@ class TrackerApp:
                   font=("Segoe UI", 8), foreground="#777777").pack(anchor="w")
         ttk.Label(settings_frame, text="Real-world distance").pack(anchor="w", pady=(4, 0))
         self.real_distance_entry = ttk.Entry(settings_frame)
-        self.real_distance_entry.insert(0, "30")
+        self.real_distance_entry.insert(0, self._entry_or_default("real_distance_entry", "30"))
         self.real_distance_entry.pack(fill="x")
         ttk.Label(settings_frame, text="Units (e.g. cm, mm, in)", font=("Segoe UI", 8)
                   ).pack(anchor="w", pady=(6, 0))
         self.units_entry = ttk.Entry(settings_frame)
-        self.units_entry.insert(0, "cm")
+        self.units_entry.insert(0, self._entry_or_default("units_entry", "cm"))
         self.units_entry.pack(fill="x")
 
-        self.preview_samples_entry = setting_field(settings_frame, "Preview frames to save/check", 6)
+        self.preview_samples_entry = setting_field(settings_frame, "Preview frames to save/check", "preview_samples_entry", 6)
 
         # ---- BOTTOM: start + progress ----
-        bottom = ttk.Frame(container, padding=10)
+        ttk.Separator(container).pack(fill="x", side="bottom")
+        bottom = ttk.Frame(container, padding=(16, 12))
         bottom.pack(fill="x", side="bottom")
-        ttk.Button(bottom, text="START TRACKING", style="Start.TButton",
-                   command=self.on_start).pack(side="left", fill="x", expand=True, ipady=8)
+
+        left_cta = ttk.Frame(bottom)
+        left_cta.pack(side="left", fill="x", expand=True)
+        ttk.Label(left_cta, text="  Ready to begin analysis",
+                  font=("Segoe UI", 8, "bold"), foreground=self._palette["SUCCESS"]).pack(anchor="w", pady=(0, 4))
+        ttk.Button(left_cta, text="▶  START TRACKING", style="Start.TButton",
+                   command=self.on_start).pack(fill="x", ipady=8)
+
         progress_col = ttk.Frame(bottom)
-        progress_col.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        progress_col.pack(side="left", fill="x", expand=True, padx=(18, 0))
+        ttk.Label(progress_col, text="Progress",
+                  font=("Segoe UI", 8, "bold"), foreground=self._palette["TEXT_SOFT"]).pack(anchor="w", pady=(0, 4))
         self.progress = ttk.Progressbar(progress_col, maximum=100, style="Green.Horizontal.TProgressbar")
-        self.progress.pack(fill="x")
+        self.progress.pack(fill="x", ipady=2)
         self.progress_label = ttk.Label(progress_col, text="", font=("Segoe UI", 8), foreground=MUTED)
-        self.progress_label.pack(anchor="w")
+        self.progress_label.pack(anchor="w", pady=(2, 0))
 
         self._last_built_mode = mode
 
@@ -1461,15 +1581,16 @@ class TrackerApp:
         out_frame.pack(fill="x")
         ttk.Label(out_frame, text="Video output size:").pack(side="left")
         self.output_size_entry = ttk.Entry(out_frame, width=12)
+        self.output_size_entry.insert(0, self._entry_or_default("output_size_entry", ""))
         self.output_size_entry.pack(side="left", padx=(6, 0))
 
         beh_frame = ttk.LabelFrame(left, text="Behaviors to detect", padding=8)
         beh_frame.pack(fill="x", pady=(10, 0))
-        self.behavior_rearing_var = tk.BooleanVar(value=True)
-        self.behavior_grooming_var = tk.BooleanVar(value=True)
-        self.behavior_locomotion_var = tk.BooleanVar(value=False)
-        self.behavior_immobile_var = tk.BooleanVar(value=False)
-        self.behavior_all_var = tk.BooleanVar(value=False)
+        self.behavior_rearing_var = tk.BooleanVar(value=self._var_or_default("behavior_rearing_var", True))
+        self.behavior_grooming_var = tk.BooleanVar(value=self._var_or_default("behavior_grooming_var", True))
+        self.behavior_locomotion_var = tk.BooleanVar(value=self._var_or_default("behavior_locomotion_var", False))
+        self.behavior_immobile_var = tk.BooleanVar(value=self._var_or_default("behavior_immobile_var", False))
+        self.behavior_all_var = tk.BooleanVar(value=self._var_or_default("behavior_all_var", False))
         ttk.Checkbutton(beh_frame, text="Rearing", variable=self.behavior_rearing_var).pack(anchor="w")
         ttk.Checkbutton(beh_frame, text="Grooming", variable=self.behavior_grooming_var).pack(anchor="w")
         ttk.Checkbutton(beh_frame, text="Locomotion", variable=self.behavior_locomotion_var).pack(anchor="w")
@@ -1483,11 +1604,11 @@ class TrackerApp:
         ttk.Label(animals_frame, text="Animals in frame:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
         animals_row = ttk.Frame(animals_frame)
         animals_row.pack(fill="x", pady=(6, 0))
-        self.num_animals = 1
+        self.num_animals = int(self._mem_get("num_animals", 1))
         self.num_animals_buttons = {}
         for n in (1, 2, 3):
             b = ttk.Button(animals_row, text=str(n), width=3,
-                           style=("Accent.TButton" if n == 1 else "Tool.TButton"),
+                           style=("Accent.TButton" if n == self.num_animals else "Tool.TButton"),
                            command=lambda n=n: self.on_num_animals(n))
             b.pack(side="left", padx=(0, 6))
             self.num_animals_buttons[n] = b
@@ -1529,7 +1650,7 @@ class TrackerApp:
 
         color_frame = ttk.LabelFrame(settings_frame, text="Analysis Color Mode", padding=8)
         color_frame.pack(fill="x", pady=(0, 10))
-        self.color_mode_var = tk.StringVar(value="gray")
+        self.color_mode_var = tk.StringVar(value=self._entry_or_default("color_mode_var", "gray"))
         ttk.Radiobutton(color_frame, text="Grayscale (default -- faster)",
                         variable=self.color_mode_var, value="gray").pack(anchor="w")
         ttk.Radiobutton(color_frame, text="RGB / Color", variable=self.color_mode_var,
@@ -1538,46 +1659,55 @@ class TrackerApp:
                   "floor but brightness doesn't)", font=("Segoe UI", 7), foreground=MUTED,
                   wraplength=255, justify="left").pack(anchor="w", padx=(18, 0))
 
-        def setting_field(parent, label_text, default):
+        def setting_field(parent, label_text, attr_name, default):
             ttk.Label(parent, text=label_text, font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 0))
             e = ttk.Entry(parent)
-            e.insert(0, str(default))
+            e.insert(0, self._entry_or_default(attr_name, default))
             e.pack(fill="x")
             return e
 
-        self.bg_samples_entry = setting_field(settings_frame, "Background samples (default 100)", 100)
-        self.threshold_entry = setting_field(settings_frame, "Difference threshold (start 25)", 25)
-        self.min_area_entry = setting_field(settings_frame, "Min mouse area, px (keep LOW)", 15)
-        self.max_area_entry = setting_field(settings_frame, "Max object area, px", 5000)
-        self.max_jump_entry = setting_field(settings_frame, "Max movement / frame, px", 100)
-        self.use_window_var = tk.BooleanVar(value=False)
-        self.use_zone_threshold_var = tk.BooleanVar(value=False)
+        self.bg_samples_entry = setting_field(settings_frame, "Background samples (default 100)", "bg_samples_entry", 100)
+        self.threshold_entry = setting_field(settings_frame, "Difference threshold (start 25)", "threshold_entry", 25)
+        self.min_area_entry = setting_field(settings_frame, "Min mouse area, px (keep LOW)", "min_area_entry", 15)
+        self.max_area_entry = setting_field(settings_frame, "Max object area, px", "max_area_entry", 5000)
+        self.max_jump_entry = setting_field(settings_frame, "Max movement / frame, px", "max_jump_entry", 100)
+        self.use_window_var = tk.BooleanVar(value=self._var_or_default("use_window_var", False))
+        self.use_zone_threshold_var = tk.BooleanVar(value=self._var_or_default("use_zone_threshold_var", False))
         self.window_size_entry = None
         self.window_weight_entry = None
         self.real_distance_entry = None
         self.units_entry = None
-        self.preview_samples_entry = setting_field(settings_frame, "Preview frames to save/check", 6)
+        self.preview_samples_entry = setting_field(settings_frame, "Preview frames to save/check", "preview_samples_entry", 6)
 
         ttk.Separator(settings_frame).pack(fill="x", pady=8)
         beh_settings = ttk.LabelFrame(settings_frame, text="Behavior Classification thresholds", padding=8)
         beh_settings.pack(fill="x")
-        self.loco_thresh_entry = setting_field(beh_settings, "Locomotion threshold (px/s)", 40)
-        self.rear_thresh_entry = setting_field(beh_settings, "Rearing area-drop threshold", 0.7)
-        self.groom_thresh_entry = setting_field(beh_settings, "Grooming motion threshold", 3.0)
-        self.immobile_thresh_entry = setting_field(beh_settings, "Immobile motion threshold", 1.0)
-        self.min_bout_entry = setting_field(beh_settings, "Min bout duration (s)", 0.3)
+        self.loco_thresh_entry = setting_field(beh_settings, "Locomotion threshold (px/s)", "loco_thresh_entry", 40)
+        self.rear_thresh_entry = setting_field(beh_settings, "Rearing area-drop threshold", "rear_thresh_entry", 0.7)
+        self.groom_thresh_entry = setting_field(beh_settings, "Grooming motion threshold", "groom_thresh_entry", 3.0)
+        self.immobile_thresh_entry = setting_field(beh_settings, "Immobile motion threshold", "immobile_thresh_entry", 1.0)
+        self.min_bout_entry = setting_field(beh_settings, "Min bout duration (s)", "min_bout_entry", 0.3)
 
         # ---- BOTTOM: start + progress ----
-        bottom = ttk.Frame(container, padding=10)
+        ttk.Separator(container).pack(fill="x", side="bottom")
+        bottom = ttk.Frame(container, padding=(16, 12))
         bottom.pack(fill="x", side="bottom")
-        ttk.Button(bottom, text="START TRACKING", style="Start.TButton",
-                   command=self.on_start).pack(side="left", fill="x", expand=True, ipady=8)
+
+        left_cta = ttk.Frame(bottom)
+        left_cta.pack(side="left", fill="x", expand=True)
+        ttk.Label(left_cta, text="  Ready to begin behavior classification",
+                  font=("Segoe UI", 8, "bold"), foreground=self._palette["SUCCESS"]).pack(anchor="w", pady=(0, 4))
+        ttk.Button(left_cta, text="▶  START TRACKING", style="Start.TButton",
+                   command=self.on_start).pack(fill="x", ipady=8)
+
         progress_col = ttk.Frame(bottom)
-        progress_col.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        progress_col.pack(side="left", fill="x", expand=True, padx=(18, 0))
+        ttk.Label(progress_col, text="Progress",
+                  font=("Segoe UI", 8, "bold"), foreground=self._palette["TEXT_SOFT"]).pack(anchor="w", pady=(0, 4))
         self.progress = ttk.Progressbar(progress_col, maximum=100, style="Green.Horizontal.TProgressbar")
-        self.progress.pack(fill="x")
+        self.progress.pack(fill="x", ipady=2)
         self.progress_label = ttk.Label(progress_col, text="", font=("Segoe UI", 8), foreground=MUTED)
-        self.progress_label.pack(anchor="w")
+        self.progress_label.pack(anchor="w", pady=(2, 0))
 
         self._last_built_mode = "behavior"
 
@@ -1695,6 +1825,7 @@ class TrackerApp:
         self.pending_matrix = None
         self.pending_warp_w = None
         self.pending_warp_h = None
+        self.pending_crop_corners = None
         self.pending_roi_points = {}
         self.pending_object_points = {}
         self.pending_mask_points = []
@@ -1714,16 +1845,32 @@ class TrackerApp:
             return
         self.videos = []
         self.active_index = None
-        self._remembered_start = "0"
-        self._remembered_end = "600"
-        self._remembered_roi_names = "Light,Dark"
-        self.start_entry.delete(0, tk.END); self.start_entry.insert(0, "0")
-        self.end_entry.delete(0, tk.END); self.end_entry.insert(0, "600")
-        self.roi_names_entry.delete(0, tk.END); self.roi_names_entry.insert(0, "Light,Dark")
-        self.object_names_entry.delete(0, tk.END)
-        self.output_size_entry.delete(0, tk.END)
-        self.interact_var.set(False); self.entries_var.set(False)
-        self.altern_var.set(False); self.all_var.set(False)
+        self._remembered_start = ""
+        self._remembered_end = ""
+        self._remembered_roi_names = ""
+        try:
+            self.start_entry.delete(0, tk.END)
+            self.end_entry.delete(0, tk.END)
+            self.roi_names_entry.delete(0, tk.END)
+            self.object_names_entry.delete(0, tk.END)
+            self.output_size_entry.delete(0, tk.END)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self.interact_var.set(False)
+            self.entries_var.set(False)
+            self.altern_var.set(False)
+            self.all_var.set(False)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            if hasattr(self, "behavior_rearing_var"): self.behavior_rearing_var.set(True)
+            if hasattr(self, "behavior_grooming_var"): self.behavior_grooming_var.set(True)
+            if hasattr(self, "behavior_locomotion_var"): self.behavior_locomotion_var.set(False)
+            if hasattr(self, "behavior_immobile_var"): self.behavior_immobile_var.set(False)
+            if hasattr(self, "behavior_all_var"): self.behavior_all_var.set(False)
+        except (tk.TclError, AttributeError):
+            pass
         self._refresh_video_list()
         self._reset_calibration_state()
         self._render_canvas()
@@ -1745,44 +1892,70 @@ class TrackerApp:
             (self.units_entry, "cm"), (self.preview_samples_entry, "6"),
         ]
         for entry, default in defaults:
-            entry.delete(0, tk.END); entry.insert(0, default)
+            if entry is not None:
+                try:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, default)
+                except (tk.TclError, AttributeError):
+                    pass
         self.use_window_var.set(False)
         self.use_zone_threshold_var.set(False)
+        if hasattr(self, "reject_shadows_var") and self.reject_shadows_var is not None:
+            self.reject_shadows_var.set(False)
+        if hasattr(self, "loco_thresh_entry") and self.loco_thresh_entry is not None:
+            try:
+                self.loco_thresh_entry.delete(0, tk.END)
+                self.loco_thresh_entry.insert(0, "40")
+            except (tk.TclError, AttributeError):
+                pass
+        if hasattr(self, "rear_thresh_entry") and self.rear_thresh_entry is not None:
+            try:
+                self.rear_thresh_entry.delete(0, tk.END)
+                self.rear_thresh_entry.insert(0, "0.7")
+            except (tk.TclError, AttributeError):
+                pass
+        if hasattr(self, "groom_thresh_entry") and self.groom_thresh_entry is not None:
+            try:
+                self.groom_thresh_entry.delete(0, tk.END)
+                self.groom_thresh_entry.insert(0, "3.0")
+            except (tk.TclError, AttributeError):
+                pass
+        if hasattr(self, "immobile_thresh_entry") and self.immobile_thresh_entry is not None:
+            try:
+                self.immobile_thresh_entry.delete(0, tk.END)
+                self.immobile_thresh_entry.insert(0, "1.0")
+            except (tk.TclError, AttributeError):
+                pass
+        if hasattr(self, "min_bout_entry") and self.min_bout_entry is not None:
+            try:
+                self.min_bout_entry.delete(0, tk.END)
+                self.min_bout_entry.insert(0, "0.3")
+            except (tk.TclError, AttributeError):
+                pass
 
     def on_reset_all(self):
         if not messagebox.askyesno("Reset everything",
-                                   "Reset all 3 panels back to defaults? This clears the video "
-                                   "queue, calibration, and settings."):
+                                   "Reset ALL back to defaults?\n\nThis clears: videos, calibration, "
+                                   "settings, and all remembered values."):
             return
+
+        # THE KEY LINE: this is the ONLY place that clears persistent memory
+        self._memory.clear()
+
         self.videos = []
         self.active_index = None
-        self._remembered_start = "0"
-        self._remembered_end = "600"
-        self._remembered_roi_names = "Light,Dark"
-        self.start_entry.delete(0, tk.END); self.start_entry.insert(0, "0")
-        self.end_entry.delete(0, tk.END); self.end_entry.insert(0, "600")
-        self.roi_names_entry.delete(0, tk.END); self.roi_names_entry.insert(0, "Light,Dark")
-        self.object_names_entry.delete(0, tk.END)
-        self.output_size_entry.delete(0, tk.END)
-        self.interact_var.set(False); self.entries_var.set(False)
-        self.altern_var.set(False); self.all_var.set(False)
+
         self._reset_calibration_state()
-        defaults = [
-            (self.bg_samples_entry, "100"), (self.threshold_entry, "25"),
-            (self.min_area_entry, "15"), (self.max_area_entry, "5000"),
-            (self.max_jump_entry, "100"), (self.window_size_entry, "120"),
-            (self.window_weight_entry, "0.5"), (self.real_distance_entry, "30"),
-            (self.units_entry, "cm"), (self.preview_samples_entry, "6"),
-        ]
-        for entry, default in defaults:
-            entry.delete(0, tk.END); entry.insert(0, default)
-        self.use_window_var.set(False)
-        self.use_zone_threshold_var.set(False)
-        self._refresh_video_list()
-        self._render_canvas()
-        self.status_label.config(text="Idle.")
-        self.progress["value"] = 0
-        self.progress_label.config(text="")
+
+        # Rebuild the entire body (will see empty memory → all fields at empty defaults)
+        self._build_setup_body()
+
+        try:
+            self.status_label.config(text="Idle.")
+            self.progress["value"] = 0
+            self.progress_label.config(text="")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Frame access
@@ -1964,7 +2137,7 @@ class TrackerApp:
         if self.pending_roi_points:
             self._draw_named_polygon_set(self.pending_roi_points, color="black")
         if self.pending_object_points:
-            self._draw_object_set(self.pending_object_points, color="orange")
+            self._draw_named_polygon_set(self.pending_object_points, color="#d2691e")
 
     def _draw_polygon_set(self, shapes, color="black", dashed=False, point_radius=3, active_shape=None):
         dash = (4, 2) if dashed else None
@@ -2006,15 +2179,6 @@ class TrackerApp:
                 lx, ly = self._to_canvas_xy(mx, my)
                 self.canvas.create_text(lx, ly, text=name, fill=color, font=("Segoe UI", 9, "bold"), tags="overlay")
 
-    def _draw_object_set(self, object_points, color="orange"):
-        for name, spec in object_points.items():
-            ccx, ccy = self._to_canvas_xy(*spec["center"])
-            rr = spec["radius"] * self._canvas_scale
-            self.canvas.create_oval(ccx - rr, ccy - rr, ccx + rr, ccy + rr, outline=color, width=2, tags="overlay")
-            self.canvas.create_oval(ccx - 3, ccy - 3, ccx + 3, ccy + 3, fill=color, tags="overlay")
-            self.canvas.create_text(ccx, ccy - rr - 10, text=name, fill=color,
-                                    font=("Segoe UI", 9, "bold"), tags="overlay")
-
     # ------------------------------------------------------------------
     # Embedded operations: Crop / Mask / Zones / Objects / Distance
     # ------------------------------------------------------------------
@@ -2031,7 +2195,7 @@ class TrackerApp:
         self.op_instructions = ttk.Label(self.op_bar, text="", font=("Segoe UI", 9))
         self.op_instructions.pack(side="left")
 
-        if kind == "zones":
+        if kind in ("zones", "objects"):
             self.op_region_row = ttk.Frame(self.op_bar)
             self.op_region_row.pack(side="left", padx=(12, 0))
             self._rebuild_zone_region_buttons()
@@ -2075,16 +2239,11 @@ class TrackerApp:
             n_pts = len(op["shapes"][-1])
             text = (f"Shape {n_shapes} ({n_pts} pts so far). Click to add points, "
                     "'New Shape' to start another masked region.")
-        elif op["kind"] == "zones":
+        elif op["kind"] in ("zones", "objects"):
             name = op["active_region"]
             n = len(op["regions"][name])
-            text = f"Drawing '{name}' ({n} pts, need 3+). Click a region name above to switch."
-        elif op["kind"] == "objects":
-            if op["name_idx"] < len(op["names"]):
-                name = op["names"][op["name_idx"]]
-                text = f"Click the center of '{name}', then drag outward to set its radius."
-            else:
-                text = "All objects placed."
+            noun = "zone" if op["kind"] == "zones" else "object"
+            text = f"Drawing {noun} '{name}' ({n} pts, need 3+ -- trace its outline). Click a name above to switch."
         elif op["kind"] == "distance":
             text = f"Click 2 points of known real-world distance ({len(op['points'])}/2 placed)."
         else:
@@ -2129,19 +2288,17 @@ class TrackerApp:
         op = {"kind": kind, "drag": None, "_base_frame": base_frame}
 
         if kind == "crop":
-            op["shapes"] = [[]]
+            saved = getattr(self, "pending_crop_corners", None)
+            if saved and len(saved) == 4:
+                op["shapes"] = [list(saved)]
+            else:
+                op["shapes"] = [[]]
         elif kind == "mask":
             op["shapes"] = [list(p) for p in self.pending_mask_points] if self.pending_mask_points else [[]]
-        elif kind == "zones":
-            op["regions"] = {n: list(self.pending_roi_points.get(n, [])) for n in names}
+        elif kind in ("zones", "objects"):
+            existing = self.pending_roi_points if kind == "zones" else self.pending_object_points
+            op["regions"] = {n: list(existing.get(n, [])) for n in names}
             op["active_region"] = names[0]
-        elif kind == "objects":
-            op["names"] = names
-            op["name_idx"] = 0
-            op["object_points"] = {}
-            op["stage"] = "click_center"
-            op["current_center"] = None
-            op["current_radius"] = 0
         elif kind == "distance":
             op["points"] = []
 
@@ -2169,6 +2326,7 @@ class TrackerApp:
                 messagebox.showerror("Not done", "Click all 4 corners first.")
                 return
             matrix, w, h = compute_perspective_transform(op["shapes"][0])
+            self.pending_crop_corners = list(op["shapes"][0])
             self.pending_use_crop = True
             self.pending_matrix, self.pending_warp_w, self.pending_warp_h = matrix, w, h
             self.pending_roi_points = {}
@@ -2178,15 +2336,16 @@ class TrackerApp:
         elif op["kind"] == "mask":
             self.pending_mask_points = [s for s in op["shapes"] if len(s) >= 3]
 
-        elif op["kind"] == "zones":
+        elif op["kind"] in ("zones", "objects"):
             incomplete = [n for n, pts in op["regions"].items() if len(pts) < 3]
             if incomplete:
-                messagebox.showerror("Not done", f"These zones still need 3+ points: {', '.join(incomplete)}")
+                noun = "zones" if op["kind"] == "zones" else "objects"
+                messagebox.showerror("Not done", f"These {noun} still need 3+ points: {', '.join(incomplete)}")
                 return
-            self.pending_roi_points = dict(op["regions"])
-
-        elif op["kind"] == "objects":
-            self.pending_object_points = dict(op["object_points"])
+            if op["kind"] == "zones":
+                self.pending_roi_points = dict(op["regions"])
+            else:
+                self.pending_object_points = dict(op["regions"])
 
         elif op["kind"] == "distance":
             if len(op["points"]) != 2:
@@ -2242,9 +2401,9 @@ class TrackerApp:
             else:
                 op["shapes"][-1].append((fx, fy))
 
-        elif op["kind"] == "zones":
+        elif op["kind"] in ("zones", "objects"):
             # Only hit-test the ACTIVE region's own points, not every region --
-            # adjacent zones sharing a border (e.g. Light/Dark touching at
+            # adjacent regions sharing a border (e.g. Light/Dark touching at
             # x=100) can have points a click or two apart, which would
             # otherwise grab a point from the wrong region entirely.
             active_pts = op["regions"][op["active_region"]]
@@ -2253,12 +2412,6 @@ class TrackerApp:
                 op["drag"] = ("region", op["active_region"], idx)
             else:
                 op["regions"][op["active_region"]].append((fx, fy))
-
-        elif op["kind"] == "objects":
-            if op["name_idx"] < len(op["names"]) and op["stage"] == "click_center":
-                op["current_center"] = (fx, fy)
-                op["current_radius"] = 1
-                op["stage"] = "drag_radius"
 
         elif op["kind"] == "distance":
             idx = self._find_nearby_point(op["points"], fx, fy)
@@ -2288,10 +2441,6 @@ class TrackerApp:
                 _, idx = op["drag"]
                 op["points"][idx] = (fx, fy)
             self._redraw_op()
-        elif op["kind"] == "objects" and op.get("stage") == "drag_radius" and op["current_center"] is not None:
-            cx, cy = op["current_center"]
-            op["current_radius"] = max(3, math.hypot(fx - cx, fy - cy))
-            self._redraw_op()
 
     def _on_canvas_release(self, event):
         op = self._op
@@ -2301,18 +2450,6 @@ class TrackerApp:
         if op.get("drag"):
             op["drag"] = None
             return
-
-        if op["kind"] == "objects" and op.get("stage") == "drag_radius":
-            name = op["names"][op["name_idx"]]
-            op["object_points"][name] = {"center": op["current_center"], "radius": op["current_radius"]}
-            op["name_idx"] += 1
-            op["current_center"] = None
-            op["current_radius"] = 0
-            op["stage"] = "click_center"
-            self._update_op_instructions()
-            self._redraw_op()
-            if op["name_idx"] >= len(op["names"]):
-                self._finish_op()
 
     def _redraw_op(self):
         self.canvas.delete("overlay")
@@ -2328,12 +2465,7 @@ class TrackerApp:
         elif op["kind"] == "zones":
             self._draw_named_polygon_set(op["regions"], color="black", active_region=op["active_region"])
         elif op["kind"] == "objects":
-            self._draw_object_set(op["object_points"], color="orange")
-            if op["current_center"] is not None:
-                cx, cy = self._to_canvas_xy(*op["current_center"])
-                r = op["current_radius"] * self._canvas_scale
-                self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline="orange", width=2, tags="overlay")
-                self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill="orange", tags="overlay")
+            self._draw_named_polygon_set(op["regions"], color="#d2691e", active_region=op["active_region"])
         elif op["kind"] == "distance":
             for pt in op["points"]:
                 cx, cy = self._to_canvas_xy(*pt)
@@ -2354,6 +2486,7 @@ class TrackerApp:
             return
         self._set_active_tool("nocrop")
         h, w = raw.shape[:2]
+        self.pending_crop_corners = None
         self.pending_use_crop = False
         self.pending_matrix, self.pending_warp_w, self.pending_warp_h = identity_transform(w, h)
         self.pending_roi_points = {}
@@ -2398,6 +2531,17 @@ class TrackerApp:
 
     def _build_setup(self, video_path):
         try:
+            start_raw = self.start_entry.get().strip()
+            end_raw = self.end_entry.get().strip()
+            if not start_raw or not end_raw:
+                cap = cv2.VideoCapture(video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap.release()
+                full_duration = total_frames / fps if fps else 0.0
+            start_time = float(start_raw) if start_raw else 0.0
+            end_time = float(end_raw) if end_raw else full_duration
+
             setup = {
                 "video_path": video_path,
                 "use_crop": self.pending_use_crop,
@@ -2418,15 +2562,16 @@ class TrackerApp:
                 "max_area": float(self.max_area_entry.get()),
                 "max_jump": float(self.max_jump_entry.get()),
                 "use_zone_threshold": self.use_zone_threshold_var.get(),
+                "reject_shadows": getattr(self, "reject_shadows_var", tk.BooleanVar(value=False)).get(),
                 "use_window": self.use_window_var.get(),
-                "window_size": float(self.window_size_entry.get()),
-                "window_weight": float(self.window_weight_entry.get()),
+                "window_size": float(self.window_size_entry.get()) if getattr(self, "window_size_entry", None) is not None else 120.0,
+                "window_weight": float(self.window_weight_entry.get()) if getattr(self, "window_weight_entry", None) is not None else 0.5,
                 "scale_factor": getattr(self, "pending_scale_factor", None),
                 "scale_unit": getattr(self, "pending_scale_unit", None),
                 "preview_samples": int(float(self.preview_samples_entry.get())),
                 "color_mode": self.color_mode_var.get(),
-                "start_time": float(self.start_entry.get()),
-                "end_time": float(self.end_entry.get()),
+                "start_time": start_time,
+                "end_time": end_time,
                 "output_dir_override": None,
                 "compute_arm_entries": self.entries_var.get(),
                 "compute_alternation": self.altern_var.get(),
@@ -2443,6 +2588,36 @@ class TrackerApp:
         if self.active_index is None:
             messagebox.showerror("No video selected", "Click a video in the list to select it.")
             return
+
+        try:
+            min_area = int(float(getattr(self, "min_area_entry", None).get())) if getattr(self, "min_area_entry", None) else 15
+            max_area = int(float(getattr(self, "max_area_entry", None).get())) if getattr(self, "max_area_entry", None) else 5000
+            if min_area >= max_area:
+                messagebox.showerror(
+                    "Invalid area settings",
+                    f"Min mouse area ({min_area} px) must be LESS THAN Max object area ({max_area} px)."
+                )
+                return
+        except (ValueError, tk.TclError, AttributeError):
+            pass
+
+        try:
+            start_raw = getattr(self, "start_entry", None).get() if getattr(self, "start_entry", None) else ""
+            end_raw = getattr(self, "end_entry", None).get() if getattr(self, "end_entry", None) else ""
+            if start_raw.strip() and end_raw.strip():
+                start_s = float(start_raw)
+                end_s = float(end_raw)
+                if start_s >= end_s:
+                    messagebox.showerror(
+                        "Invalid time window",
+                        f"Start time ({start_s}s) must be LESS THAN end time ({end_s}s)."
+                    )
+                    return
+                if start_s < 0:
+                    messagebox.showerror("Invalid time window", "Start time cannot be negative.")
+                    return
+        except (ValueError, tk.TclError, AttributeError):
+            pass
 
         if self.analysis_type == "standard":
             self._run_standard_flow()
@@ -2474,10 +2649,19 @@ class TrackerApp:
                                                progress_callback=self.on_progress)
             except SystemExit as exc:
                 self.status_label.config(text=f"Stopped: {exc}")
+                cv2.destroyAllWindows()
+                return
+            except Exception as exc:
+                self.status_label.config(text=f"Error: {type(exc).__name__}")
+                cv2.destroyAllWindows()
+                messagebox.showerror("Tracking Error", f"An error occurred during tracking:\n\n{type(exc).__name__}: {exc}")
                 return
             self.progress["value"] = 100
             self.status_label.config(text="Done.")
-            self._show_results_standard(summary)
+            try:
+                self._show_results_standard(summary)
+            except Exception as exc:
+                messagebox.showerror("Results Error", f"Could not display results:\n\n{type(exc).__name__}: {exc}")
             return
 
         same_camera = ask_yes_no(
@@ -2489,36 +2673,57 @@ class TrackerApp:
         )
 
         summaries = []
+        errors = []
         for i, v in enumerate(self.videos):
             print(f"\n[{i + 1}/{len(self.videos)}] Processing: {v['path']}")
-            if i == 0 or same_camera:
-                setup = dict(base_setup)
-                setup["video_path"] = v["path"]
-            else:
-                setup = recalibrate_spatial_only(v["path"], base_setup)
-
             try:
+                if i == 0 or same_camera:
+                    setup = dict(base_setup)
+                    setup["video_path"] = v["path"]
+                else:
+                    try:
+                        setup = recalibrate_spatial_only(v["path"], base_setup)
+                    except SystemExit:
+                        print(f"  Skipped: calibration cancelled for this video")
+                        errors.append((os.path.basename(v["path"]), "Calibration cancelled"))
+                        continue
                 summary = process_single_video(v["path"], setup, show_display=True,
                                                progress_callback=self.on_progress)
                 summaries.append(summary)
             except SystemExit as exc:
                 print(f"  Skipped: {exc}")
+                errors.append((os.path.basename(v["path"]), str(exc)))
+                continue
+            except Exception as exc:
+                print(f"  Error: {type(exc).__name__}: {exc}")
+                errors.append((os.path.basename(v["path"]), f"{type(exc).__name__}: {exc}"))
                 continue
 
+        cv2.destroyAllWindows()
         self.progress["value"] = 100
 
         if summaries:
             batch_df = pd.DataFrame(summaries)
             folder = os.path.dirname(self.videos[0]["path"])
             batch_path = os.path.join(folder, "BatchSummary.csv")
-            batch_df.to_csv(batch_path, index=False)
+            try:
+                batch_df.to_csv(batch_path, index=False)
+            except Exception as exc:
+                messagebox.showerror("Save Error", f"Could not save batch summary CSV:\n\n{exc}")
             self.status_label.config(text="Batch complete.")
-            messagebox.showinfo(
-                "Batch Complete",
-                f"Processed {len(summaries)}/{len(self.videos)} videos.\n\nBatch summary:\n{batch_path}"
-            )
+            msg = f"Processed {len(summaries)}/{len(self.videos)} videos.\n\nBatch summary:\n{batch_path}"
+            if errors:
+                msg += f"\n\n{len(errors)} video(s) had issues:\n"
+                for name, err in errors[:10]:
+                    msg += f"  - {name}: {err}\n"
+            messagebox.showinfo("Batch Complete", msg)
         else:
             self.status_label.config(text="Batch: no videos processed.")
+            if errors:
+                msg = f"No videos were successfully processed ({len(errors)} had issues):\n\n"
+                for name, err in errors[:15]:
+                    msg += f"  - {name}: {err}\n"
+                messagebox.showwarning("Batch Complete", msg)
 
     # ------------------------------------------------------------------
     # Multi-Mouse Tracking / Behavior Classification: shared video prep
@@ -2592,47 +2797,48 @@ class TrackerApp:
             return
 
         active_path = self.videos[self.active_index]["path"]
+        tmp_path = None
 
         try:
-            min_area = int(float(self.min_area_entry.get()))
-            max_area = int(float(self.max_area_entry.get()))
-            threshold = int(float(self.threshold_entry.get()))
-            bg_samples = int(float(self.bg_samples_entry.get()))
-        except ValueError:
-            messagebox.showerror("Invalid setting", "Check the Detection Settings values.")
-            return
+            try:
+                min_area = int(float(self.min_area_entry.get()))
+                max_area = int(float(self.max_area_entry.get()))
+                threshold = int(float(self.threshold_entry.get()))
+                bg_samples = int(float(self.bg_samples_entry.get()))
+            except ValueError:
+                messagebox.showerror("Invalid setting", "Check the Detection Settings values.")
+                return
 
-        self.progress["value"] = 0
-        self.status_label.config(text="Preparing video...")
-        self.root.update_idletasks()
+            self.progress["value"] = 0
+            self.status_label.config(text="Preparing video...")
+            self.root.update_idletasks()
 
-        source_path, tmp_path, fps = self._prepare_source_video(active_path)
-        output_dir = compute_output_dir(active_path)
-        tracks_csv = os.path.join(output_dir, "tracks.csv")
-        annotate_path = os.path.join(output_dir, "preview.mp4")
+            source_path, tmp_path, fps = self._prepare_source_video(active_path)
+            output_dir = compute_output_dir(active_path)
+            tracks_csv = os.path.join(output_dir, "tracks.csv")
+            annotate_path = os.path.join(output_dir, "preview.mp4")
 
-        try:
-            preview_n = int(float(self.preview_samples_entry.get()))
-        except ValueError:
-            preview_n = 6
+            try:
+                preview_n = int(float(self.preview_samples_entry.get()))
+            except ValueError:
+                preview_n = 6
 
-        self.status_label.config(text="Saving reference frames...")
-        self.root.update_idletasks()
-        try:
-            preview_paths = save_preview_frames_multi_mouse(
-                source_path, output_dir, n_samples=preview_n,
-                num_animals=self.num_animals, min_area=min_area, max_area=max_area,
-                diff_threshold=threshold, n_background_samples=bg_samples,
-                color_mode=self.color_mode_var.get(),
-            )
-        except Exception as exc:
-            messagebox.showerror("Reference frames failed", str(exc))
-            preview_paths = []
+            self.status_label.config(text="Saving reference frames...")
+            self.root.update_idletasks()
+            try:
+                preview_paths = save_preview_frames_multi_mouse(
+                    source_path, output_dir, n_samples=preview_n,
+                    num_animals=self.num_animals, min_area=min_area, max_area=max_area,
+                    diff_threshold=threshold, n_background_samples=bg_samples,
+                    color_mode=self.color_mode_var.get(),
+                )
+            except Exception as exc:
+                print(f"[warn] Reference frames: {exc}")
+                preview_paths = []
 
-        self.status_label.config(text="Tracking (multi-mouse)...")
-        self.root.update_idletasks()
+            self.status_label.config(text="Tracking (multi-mouse)...")
+            self.root.update_idletasks()
 
-        try:
             tracks_df = track_video(
                 source_path, tracks_csv, annotate_path=annotate_path,
                 num_animals=self.num_animals, min_area=min_area, max_area=max_area,
@@ -2640,66 +2846,86 @@ class TrackerApp:
                 progress_callback=self.on_progress, show_display=True,
                 color_mode=self.color_mode_var.get(),
             )
+            cv2.destroyAllWindows()
+
+            # Per-mouse zone/object/distance stats
+            object_names = [n.strip() for n in self.object_names_entry.get().split(",") if n.strip()] \
+                if self.interact_var.get() else []
+            active_object_points = {k: v for k, v in self.pending_object_points.items() if k in object_names} \
+                if object_names else {}
+            try:
+                min_bout_s = float(self.min_bout_entry.get()) if getattr(self, "min_bout_entry", None) else 0.3
+            except (ValueError, tk.TclError):
+                min_bout_s = 0.3
+
+            per_mouse_summary = {}
+            per_mouse_bouts = {}
+            if tracks_df is not None and len(tracks_df) > 0:
+                roi_to_use = self.pending_roi_points if self.loc_var.get() else {}
+                for mouse_id, sub in tracks_df.groupby("mouse_id"):
+                    sub = sub.sort_values("frame").reset_index(drop=True)
+                    try:
+                        if "x" in sub.columns and "y" in sub.columns and "frame" in sub.columns:
+                            summary, bouts = compute_zone_interaction_stats(
+                                sub, roi_to_use, active_object_points,
+                                self.pending_warp_w, self.pending_warp_h, fps, min_bout_s=min_bout_s,
+                                scale_factor=self.pending_scale_factor, scale_unit=self.pending_scale_unit,
+                            )
+                            per_mouse_summary[mouse_id] = summary
+                            per_mouse_bouts[mouse_id] = bouts
+                    except Exception as exc:
+                        print(f"[warn] zone stats for {mouse_id}: {exc}")
+
+            summary_csv = None
+            bouts_csv = None
+            try:
+                if per_mouse_summary:
+                    summary_df = pd.DataFrame.from_dict(per_mouse_summary, orient="index")
+                    summary_df.index.name = "mouse_id"
+                    summary_csv = os.path.join(output_dir, "per_mouse_summary.csv")
+                    summary_df.to_csv(summary_csv)
+                all_bouts_rows = []
+                for mouse_id, bouts in per_mouse_bouts.items():
+                    for b in bouts:
+                        row = dict(b)
+                        row["mouse_id"] = mouse_id
+                        all_bouts_rows.append(row)
+                if all_bouts_rows:
+                    bouts_csv = os.path.join(output_dir, "per_mouse_object_bouts.csv")
+                    pd.DataFrame(all_bouts_rows).to_csv(bouts_csv, index=False)
+            except Exception as exc:
+                print(f"[warn] saving per-mouse CSV: {exc}")
+
+            self.progress["value"] = 100
+            self.status_label.config(text="Done.")
+
+            results = {
+                "analysis_type": "multi_mouse", "video_path": active_path, "output_dir": output_dir,
+                "tracks_df": tracks_df if tracks_df is not None else pd.DataFrame(),
+                "tracks_csv": tracks_csv, "annotate_path": annotate_path,
+                "fps": fps, "per_mouse_summary": per_mouse_summary, "per_mouse_bouts": per_mouse_bouts,
+                "summary_csv": summary_csv, "bouts_csv": bouts_csv, "preview_paths": preview_paths,
+            }
+            try:
+                self._show_results_multi_mouse(results)
+            except Exception as exc:
+                messagebox.showerror("Results Error", f"Could not display results:\n\n{type(exc).__name__}: {exc}")
+
+        except SystemExit as exc:
+            self.status_label.config(text=f"Stopped: {exc}")
+            cv2.destroyAllWindows()
+            return
         except Exception as exc:
-            messagebox.showerror("Tracking failed", str(exc))
+            self.status_label.config(text=f"Error: {type(exc).__name__}")
+            cv2.destroyAllWindows()
+            messagebox.showerror("Multi-Mouse Error", f"An error occurred:\n\n{type(exc).__name__}: {exc}")
             return
         finally:
             if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        # Per-mouse zone/object/distance stats -- reuses the exact same
-        # mask/membership/bout machinery Standard Tracking uses, applied to
-        # each mouse_id's own (x, y) trajectory in turn, so zones/objects/
-        # distance calibration drawn on the Preview panel actually work here
-        # too, not just for single-animal tracking.
-        object_names = [n.strip() for n in self.object_names_entry.get().split(",") if n.strip()] \
-            if self.interact_var.get() else []
-        active_object_points = {k: v for k, v in self.pending_object_points.items() if k in object_names} \
-            if object_names else {}
-        try:
-            min_bout_s = float(self.min_bout_entry.get()) if getattr(self, "min_bout_entry", None) else 0.3
-        except ValueError:
-            min_bout_s = 0.3
-
-        per_mouse_summary = {}
-        per_mouse_bouts = {}
-        for mouse_id, sub in tracks_df.groupby("mouse_id"):
-            sub = sub.sort_values("frame").reset_index(drop=True)
-            summary, bouts = compute_zone_interaction_stats(
-                sub, self.pending_roi_points if self.loc_var.get() else {}, active_object_points,
-                self.pending_warp_w, self.pending_warp_h, fps, min_bout_s=min_bout_s,
-                scale_factor=self.pending_scale_factor, scale_unit=self.pending_scale_unit,
-            )
-            per_mouse_summary[mouse_id] = summary
-            per_mouse_bouts[mouse_id] = bouts
-
-        summary_csv = None
-        bouts_csv = None
-        if per_mouse_summary:
-            summary_df = pd.DataFrame.from_dict(per_mouse_summary, orient="index")
-            summary_df.index.name = "mouse_id"
-            summary_csv = os.path.join(output_dir, "per_mouse_summary.csv")
-            summary_df.to_csv(summary_csv)
-        all_bouts_rows = []
-        for mouse_id, bouts in per_mouse_bouts.items():
-            for b in bouts:
-                row = dict(b)
-                row["mouse_id"] = mouse_id
-                all_bouts_rows.append(row)
-        if all_bouts_rows:
-            bouts_csv = os.path.join(output_dir, "per_mouse_object_bouts.csv")
-            pd.DataFrame(all_bouts_rows).to_csv(bouts_csv, index=False)
-
-        self.progress["value"] = 100
-        self.status_label.config(text="Done.")
-
-        results = {
-            "analysis_type": "multi_mouse", "video_path": active_path, "output_dir": output_dir,
-            "tracks_df": tracks_df, "tracks_csv": tracks_csv, "annotate_path": annotate_path,
-            "fps": fps, "per_mouse_summary": per_mouse_summary, "per_mouse_bouts": per_mouse_bouts,
-            "summary_csv": summary_csv, "bouts_csv": bouts_csv, "preview_paths": preview_paths,
-        }
-        self._show_results_multi_mouse(results)
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Behavior Classification
@@ -2711,52 +2937,53 @@ class TrackerApp:
             return
 
         active_path = self.videos[self.active_index]["path"]
-
+        tmp_path = None
         try:
-            min_area = int(float(self.min_area_entry.get()))
-            max_area = int(float(self.max_area_entry.get()))
-            threshold = int(float(self.threshold_entry.get()))
-            bg_samples = int(float(self.bg_samples_entry.get()))
-            loco_thresh = float(self.loco_thresh_entry.get())
-            rear_thresh = float(self.rear_thresh_entry.get())
-            groom_thresh = float(self.groom_thresh_entry.get())
-            immobile_thresh = float(self.immobile_thresh_entry.get())
-            min_bout_s = float(self.min_bout_entry.get())
-        except ValueError:
-            messagebox.showerror("Invalid setting", "Check the Detection Settings values.")
-            return
+            try:
+                min_area = int(float(self.min_area_entry.get()))
+                max_area = int(float(self.max_area_entry.get()))
+                threshold = int(float(self.threshold_entry.get()))
+                bg_samples = int(float(self.bg_samples_entry.get()))
+                loco_thresh = float(self.loco_thresh_entry.get())
+                rear_thresh = float(self.rear_thresh_entry.get())
+                groom_thresh = float(self.groom_thresh_entry.get())
+                immobile_thresh = float(self.immobile_thresh_entry.get())
+                min_bout_s = float(self.min_bout_entry.get())
+            except (ValueError, tk.TclError, AttributeError):
+                messagebox.showerror("Invalid setting", "Check the Detection Settings values.")
+                return
 
-        self.progress["value"] = 0
-        self.status_label.config(text="Preparing video...")
-        self.root.update_idletasks()
+            self.progress["value"] = 0
+            self.status_label.config(text="Preparing video...")
+            self.root.update_idletasks()
 
-        source_path, tmp_path, fps = self._prepare_source_video(active_path)
-        output_dir = compute_output_dir(active_path)
-        features_csv = os.path.join(output_dir, "features.csv")
-        bouts_csv = os.path.join(output_dir, "bouts.csv")
-        labeled_csv = os.path.join(output_dir, "labeled_frames.csv")
+            source_path, tmp_path, fps = self._prepare_source_video(active_path)
+            output_dir = compute_output_dir(active_path)
+            self._last_output_dir = output_dir
+            features_csv = os.path.join(output_dir, "features.csv")
+            bouts_csv = os.path.join(output_dir, "bouts.csv")
+            labeled_csv = os.path.join(output_dir, "labeled_frames.csv")
 
-        try:
-            preview_n = int(float(self.preview_samples_entry.get()))
-        except ValueError:
-            preview_n = 6
+            try:
+                preview_n = int(float(self.preview_samples_entry.get()))
+            except (ValueError, tk.TclError, AttributeError):
+                preview_n = 6
 
-        self.status_label.config(text="Saving reference frames...")
-        self.root.update_idletasks()
-        try:
-            preview_paths = save_preview_frames_behavior(
-                source_path, output_dir, n_samples=preview_n, num_animals=self.num_animals,
-                min_area=min_area, max_area=max_area, diff_threshold=threshold,
-                n_background_samples=bg_samples, color_mode=self.color_mode_var.get(),
-            )
-        except Exception as exc:
-            messagebox.showerror("Reference frames failed", str(exc))
-            preview_paths = []
+            self.status_label.config(text="Saving reference frames...")
+            self.root.update_idletasks()
+            try:
+                preview_paths = save_preview_frames_behavior(
+                    source_path, output_dir, n_samples=preview_n, num_animals=self.num_animals,
+                    min_area=min_area, max_area=max_area, diff_threshold=threshold,
+                    n_background_samples=bg_samples, color_mode=self.color_mode_var.get(),
+                )
+            except Exception as exc:
+                messagebox.showerror("Reference frames failed", str(exc))
+                preview_paths = []
 
-        self.status_label.config(text="Extracting features...")
-        self.root.update_idletasks()
+            self.status_label.config(text="Extracting features...")
+            self.root.update_idletasks()
 
-        try:
             extract_features(
                 source_path, features_csv, num_animals=self.num_animals,
                 min_area=min_area, max_area=max_area, diff_threshold=threshold,
@@ -2770,29 +2997,61 @@ class TrackerApp:
                 groom_motion_thresh=groom_thresh, immobile_motion_thresh=immobile_thresh,
                 min_bout_s=min_bout_s,
             )
+
+            if labeled_df is None or len(labeled_df) == 0:
+                messagebox.showwarning(
+                    "No behavior data",
+                    "No frames could be classified. Try adjusting the detection threshold or area settings."
+                )
+
+            selected = {
+                "rearing": getattr(self, "behavior_rearing_var", tk.BooleanVar(value=True)).get(),
+                "grooming": getattr(self, "behavior_grooming_var", tk.BooleanVar(value=True)).get(),
+                "locomotion": getattr(self, "behavior_locomotion_var", tk.BooleanVar(value=True)).get(),
+                "immobile": getattr(self, "behavior_immobile_var", tk.BooleanVar(value=True)).get(),
+            }
+            if (not any(selected.values())) or getattr(self, "behavior_all_var", tk.BooleanVar(value=True)).get():
+                selected = {k: True for k in selected}
+
+            self.progress["value"] = 100
+            self.status_label.config(text="Done.")
+
+            results = {
+                "analysis_type": "behavior", "video_path": active_path, "output_dir": output_dir,
+                "labeled_df": labeled_df, "bouts_df": bouts_df, "selected_behaviors": selected,
+                "bouts_csv": bouts_csv, "labeled_csv": labeled_csv, "fps": fps, "preview_paths": preview_paths,
+            }
+            try:
+                self._show_results_behavior(results)
+            except Exception as exc:
+                messagebox.showerror("Results display failed", f"Results were saved but could not be shown: {exc}")
+
+        except SystemExit:
+            self.progress["value"] = 0
+            self.status_label.config(text="Tracking stopped.")
+            cv2.destroyAllWindows()
+            self.root.update_idletasks()
+            raise
         except Exception as exc:
-            messagebox.showerror("Classification failed", str(exc))
+            self.progress["value"] = 0
+            self.status_label.config(text="Error occurred.")
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+            self.root.update_idletasks()
+            messagebox.showerror("Tracking failed", str(exc))
             return
         finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        selected = {
-            "rearing": self.behavior_rearing_var.get(), "grooming": self.behavior_grooming_var.get(),
-            "locomotion": self.behavior_locomotion_var.get(), "immobile": self.behavior_immobile_var.get(),
-        }
-        if not any(selected.values()) or self.behavior_all_var.get():
-            selected = {k: True for k in selected}
-
-        self.progress["value"] = 100
-        self.status_label.config(text="Done.")
-
-        results = {
-            "analysis_type": "behavior", "video_path": active_path, "output_dir": output_dir,
-            "labeled_df": labeled_df, "bouts_df": bouts_df, "selected_behaviors": selected,
-            "bouts_csv": bouts_csv, "labeled_csv": labeled_csv, "fps": fps, "preview_paths": preview_paths,
-        }
-        self._show_results_behavior(results)
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Results screens
