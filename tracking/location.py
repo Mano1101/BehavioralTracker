@@ -458,6 +458,16 @@ def detect_mouse(
         perimeter = cv2.arcLength(contour, True)
         circularity = (4 * math.pi * area) / (perimeter * perimeter) if perimeter > 0 else 0
 
+        # Mean strength of the difference-from-background signal within
+        # this candidate's own contour. A genuine, directly-lit animal
+        # typically produces a much stronger, more solid signal than a
+        # reflection (e.g. in a glass/acrylic wall or glossy floor), which
+        # is dimmer and partially blended with whatever's behind the glass
+        # -- even when the reflection's area and shape look similar.
+        contour_mask = np.zeros(diff_u8.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+        mean_intensity = float(cv2.mean(diff_u8, mask=contour_mask)[0])
+
         candidates.append({
             "center": (cx, cy),
             "area": float(area),
@@ -465,6 +475,7 @@ def detect_mouse(
             "aspect": float(aspect),
             "circularity": float(circularity),
             "distance": point_distance((cx, cy), previous_point),
+            "mean_intensity": mean_intensity,
             "contour": contour
         })
 
@@ -476,12 +487,17 @@ def detect_mouse(
 
     for c in candidates:
         d = c["distance"]
+        # Reward a stronger signal with a lower (better) score -- weighted
+        # gently enough that spatial continuity still dominates once
+        # tracking is established, but it breaks ties in favor of the
+        # more solid detection when candidates are otherwise close.
+        intensity_bonus = c["mean_intensity"] * 0.15
 
         if previous_point is not None:
             if d > max_jump:
                 continue
 
-            score = d
+            score = d - intensity_bonus
 
             if previous_area is not None and previous_area > 0:
                 ratio = c["area"] / previous_area
@@ -492,7 +508,7 @@ def detect_mouse(
             if c["circularity"] < 0.02:
                 score += 10
         else:
-            score = 0
+            score = -intensity_bonus
             if c["aspect"] > 8:
                 score += 30
             score -= min(c["area"], 1000) * 0.01
