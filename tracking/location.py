@@ -171,27 +171,17 @@ def draw_roi_polygons(display, roi_points):
 # -----------------------------
 
 
-def build_point_masks(shape_hw, object_points):
-    h, w = shape_hw
-    masks = {}
-
-    for name, spec in object_points.items():
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.circle(mask, (int(spec["center"][0]), int(spec["center"][1])), int(spec["radius"]), 255, -1)
-        masks[name] = mask > 0
-
-    return masks
-
-
 def draw_object_markers(display, object_points):
-    for i, (name, spec) in enumerate(object_points.items()):
+    """object_points[name] is a polygon (list of points), same shape as
+    roi_points -- objects are marked by tracing their actual outline now,
+    not a circle that may not match the object's real shape."""
+    for i, (name, pts) in enumerate(object_points.items()):
         color = OBJECT_COLORS[i % len(OBJECT_COLORS)]
-        center = (int(spec["center"][0]), int(spec["center"][1]))
-        cv2.circle(display, center, int(spec["radius"]), color, 2)
-        cv2.putText(
-            display, name, (center[0] - 15, center[1] - int(spec["radius"]) - 8),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
-        )
+        pts_arr = np.array(pts, dtype=np.int32)
+        cv2.polylines(display, [pts_arr], True, color, 2, cv2.LINE_AA)
+        cx = int(np.mean([p[0] for p in pts]))
+        cy = int(np.mean([p[1] for p in pts]))
+        cv2.putText(display, name, (cx - 15, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
 
 def compute_zone_interaction_stats(positions_df, roi_points, object_points,
@@ -237,7 +227,7 @@ def compute_zone_interaction_stats(positions_df, roi_points, object_points,
 
     bouts = []
     if object_points:
-        object_masks = build_point_masks((warp_h, warp_w), object_points)
+        object_masks = build_roi_masks((warp_h, warp_w), object_points)
         near_cols = {name: np.zeros(len(xs), dtype=bool) for name in object_points}
         for i, (x, y) in enumerate(zip(xs, ys)):
             if not (np.isnan(x) or np.isnan(y)):
@@ -327,11 +317,38 @@ def make_background(cap, start_frame, end_frame, matrix, warp_w, warp_h, sample_
 # -----------------------------
 
 
+def _shadow_mask(current_bgr, background_bgr, v_ratio_range=(0.25, 0.92), hue_tol=25, sat_tol=60):
+    """True where a pixel looks like a SHADOW rather than a genuine change:
+    similar hue and saturation to the background at that spot, but
+    consistently darker (lower brightness/V) within the ratio range real
+    shadows typically fall in. This is the same hue/saturation/value-ratio
+    idea OpenCV's own MOG2 background subtractor uses for shadow detection
+    -- a shadow darkens the existing surface without changing its color,
+    while a genuine animal usually differs in hue/saturation too, or is
+    darkened well outside a shadow's typical ratio."""
+    cur_hsv = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    bg_hsv = cv2.cvtColor(background_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+    v_bg = bg_hsv[..., 2]
+    v_cur = cur_hsv[..., 2]
+    v_ratio = np.divide(v_cur, v_bg, out=np.ones_like(v_cur), where=v_bg > 5)
+
+    hue_diff = np.abs(cur_hsv[..., 0] - bg_hsv[..., 0])
+    hue_diff = np.minimum(hue_diff, 180 - hue_diff)  # hue wraps at 180 in OpenCV's 0-179 range
+
+    sat_diff = np.abs(cur_hsv[..., 1] - bg_hsv[..., 1])
+
+    return (
+        (v_ratio >= v_ratio_range[0]) & (v_ratio <= v_ratio_range[1])
+        & (hue_diff <= hue_tol) & (sat_diff <= sat_tol)
+    )
+
+
 def detect_mouse(
     frame, background, arena, previous_point, previous_area,
     threshold, min_area, max_area, max_jump,
     roi_masks=None, use_window=False, window_size=120, window_weight=0.5,
-    exclusion_mask=None, color_mode="gray"
+    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False
 ):
     x1, y1, x2, y2 = arena
 
@@ -375,6 +392,10 @@ def detect_mouse(
         diff = diff * weights
 
     diff_u8 = np.clip(diff, 0, 255).astype(np.uint8)
+
+    if reject_shadows and color_background is not None:
+        shadow = _shadow_mask(frame[y1:y2, x1:x2], color_background[y1:y2, x1:x2])
+        diff_u8[shadow] = 0
 
     if roi_masks:
         mask = np.zeros(diff_u8.shape, dtype=np.uint8)
@@ -489,7 +510,7 @@ def detect_mouse(
 
 
 def local_recovery(frame, background, previous_point, arena, threshold, min_area, max_area,
-                    exclusion_mask=None, color_mode="gray"):
+                    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False):
     if previous_point is None:
         return None
 
@@ -515,6 +536,10 @@ def local_recovery(frame, background, previous_point, arena, threshold, min_area
 
     if exclusion_mask is not None:
         diff[exclusion_mask[y1:y2, x1:x2]] = 0
+
+    if reject_shadows and color_background is not None:
+        shadow = _shadow_mask(frame[y1:y2, x1:x2], color_background[y1:y2, x1:x2])
+        diff[shadow] = 0
 
     _, mask = cv2.threshold(diff, int(threshold), 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -594,7 +619,8 @@ def run_detection_preview(
     cap, matrix, warp_w, warp_h, start_frame, end_frame,
     background, arena, roi_masks, roi_points, object_points,
     threshold, min_area, max_area, n_samples, output_dir, show_live=True,
-    mask_polygons=None, exclusion_mask=None, color_mode="gray"
+    mask_polygons=None, exclusion_mask=None, color_mode="gray",
+    color_background=None, reject_shadows=False
 ):
     preview_dir = os.path.join(output_dir, "preview")
     os.makedirs(preview_dir, exist_ok=True)
@@ -618,7 +644,8 @@ def run_detection_preview(
         candidate, _ = detect_mouse(
             frame, background, arena, None, None,
             threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1),
-            float("inf"), roi_masks=roi_masks, exclusion_mask=exclusion_mask, color_mode=color_mode
+            float("inf"), roi_masks=roi_masks, exclusion_mask=exclusion_mask, color_mode=color_mode,
+            color_background=color_background, reject_shadows=reject_shadows
         )
 
         disp = frame.copy()
@@ -717,7 +744,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
     object_points = setup.get("object_points", {})
     object_names = setup.get("object_names", [])
-    object_masks = build_point_masks((warp_h, warp_w), object_points) if object_points else {}
+    object_masks = build_roi_masks((warp_h, warp_w), object_points) if object_points else {}
     behavior_names = setup.get("behavior_names", [])
 
     mask_polygons = setup.get("mask_points", [])
@@ -739,11 +766,22 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         output_dir = compute_output_dir(video_path)
 
     color_mode = setup.get("color_mode", "gray")
+    reject_shadows = setup.get("reject_shadows", False)
 
     background = make_background(
         cap, start_frame, end_frame, matrix, warp_w, warp_h, setup["background_samples"],
         color_mode=color_mode
     )
+
+    # Shadow rejection needs a COLOR reference regardless of color_mode --
+    # only build the extra background model when the feature is actually
+    # turned on, since it's otherwise wasted work.
+    color_background = background if color_mode == "rgb" else None
+    if reject_shadows and color_background is None:
+        color_background = make_background(
+            cap, start_frame, end_frame, matrix, warp_w, warp_h, setup["background_samples"],
+            color_mode="rgb"
+        )
 
     if show_display:
         cv2.imshow("Automatic background - press ENTER", background)
@@ -761,7 +799,8 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         cap, matrix, warp_w, warp_h, start_frame, end_frame,
         background, arena, detection_roi_masks, roi_points, object_points,
         threshold, min_area, max_area, setup["preview_samples"], output_dir, show_live=show_display,
-        mask_polygons=mask_polygons, exclusion_mask=exclusion_mask, color_mode=color_mode
+        mask_polygons=mask_polygons, exclusion_mask=exclusion_mask, color_mode=color_mode,
+        color_background=color_background, reject_shadows=reject_shadows
     )
 
     # -----------------------------------------
@@ -797,7 +836,8 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1), max_jump,
             roi_masks=detection_roi_masks, use_window=use_window,
             window_size=window_size, window_weight=window_weight,
-            exclusion_mask=exclusion_mask, color_mode=color_mode
+            exclusion_mask=exclusion_mask, color_mode=color_mode,
+            color_background=color_background, reject_shadows=reject_shadows
         )
 
         used_recovery = False
@@ -806,7 +846,8 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             candidate = local_recovery(
                 frame, background, previous_point, arena,
                 threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1),
-                exclusion_mask=exclusion_mask, color_mode=color_mode
+                exclusion_mask=exclusion_mask, color_mode=color_mode,
+                color_background=color_background, reject_shadows=reject_shadows
             )
             used_recovery = candidate is not None
 
@@ -1034,8 +1075,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
     roi_coords = pd.DataFrame(
         [{"ROI": name, "Vertices_xy": str(pts)} for name, pts in roi_points.items()]
-        + [{"ROI": name, "Vertices_xy": f"center={spec['center']} radius={spec['radius']}"}
-           for name, spec in object_points.items()]
+        + [{"ROI": name, "Vertices_xy": str(pts)} for name, pts in object_points.items()]
     )
 
     interactions_df = pd.DataFrame(bouts) if bouts else pd.DataFrame(
@@ -1048,7 +1088,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         transitions, roi_coords, interactions_df
     )
 
-    save_plots(df, output_dir, roi_points, object_points, warp_w, warp_h)
+    save_plots(df, output_dir, roi_points, object_points, warp_w, warp_h, background=background)
 
     # -----------------------------------------
     # Final report
