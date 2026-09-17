@@ -1375,6 +1375,21 @@ class TrackerApp:
             ttk.Label(settings_frame, text="(if the tracker keeps grabbing the animal's shadow "
                       "instead of its body, try this)", font=("Segoe UI", 7),
                       foreground=MUTED, wraplength=255, justify="left").pack(anchor="w", padx=(18, 0))
+
+            polarity_frame = ttk.LabelFrame(settings_frame, text="Animal is...", padding=8)
+            polarity_frame.pack(fill="x", pady=(10, 0))
+            self.polarity_var = tk.StringVar(value="either")
+            ttk.Radiobutton(polarity_frame, text="Either (default)", variable=self.polarity_var,
+                            value="either").pack(anchor="w")
+            ttk.Radiobutton(polarity_frame, text="Darker than the floor", variable=self.polarity_var,
+                            value="darker").pack(anchor="w")
+            ttk.Radiobutton(polarity_frame, text="Lighter than the floor", variable=self.polarity_var,
+                            value="lighter").pack(anchor="w")
+            ttk.Label(polarity_frame, text="If glare or a reflection off a glass/acrylic wall keeps "
+                      "getting mistaken for the animal, picking the correct direction here makes that "
+                      "artifact invisible to detection instead of competing with the real animal.",
+                      font=("Segoe UI", 7), foreground=MUTED, wraplength=255,
+                      justify="left").pack(anchor="w", pady=(4, 0))
         else:
             self.window_size_entry = None
             self.window_weight_entry = None
@@ -1755,6 +1770,7 @@ class TrackerApp:
         self.use_window_var.set(False)
         self.use_zone_threshold_var.set(False)
         self.reject_shadows_var.set(False)
+        self.polarity_var.set("either")
 
     def on_reset_all(self):
         if not messagebox.askyesno("Reset everything",
@@ -1786,6 +1802,7 @@ class TrackerApp:
         self.use_window_var.set(False)
         self.use_zone_threshold_var.set(False)
         self.reject_shadows_var.set(False)
+        self.polarity_var.set("either")
         self._refresh_video_list()
         self._render_canvas()
         self.status_label.config(text="Idle.")
@@ -2392,6 +2409,7 @@ class TrackerApp:
                 "max_jump": float(self.max_jump_entry.get()),
                 "use_zone_threshold": self.use_zone_threshold_var.get(),
                 "reject_shadows": self.reject_shadows_var.get(),
+                "polarity": self.polarity_var.get(),
                 "use_window": self.use_window_var.get(),
                 "window_size": float(self.window_size_entry.get()),
                 "window_weight": float(self.window_weight_entry.get()),
