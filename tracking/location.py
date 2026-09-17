@@ -344,11 +344,30 @@ def _shadow_mask(current_bgr, background_bgr, v_ratio_range=(0.25, 0.92), hue_to
     )
 
 
+def _polarity_diff(current, background, polarity="either"):
+    """Difference-from-background, but aware of which DIRECTION the animal
+    is expected to differ in. A common source of false detections -- glare
+    or a reflection off a glass/acrylic wall -- is BRIGHTER than the floor,
+    while a dark-furred animal is always DARKER than it (and vice versa
+    for a light-furred animal on a dark floor). Restricting to the
+    direction the real animal is known to go makes an opposite-direction
+    artifact invisible to detection entirely, instead of it competing with
+    the real animal on equal footing the way an absolute difference does.
+    polarity="either" reproduces the previous (direction-blind) behavior."""
+    if polarity == "either":
+        return cv2.absdiff(current, background)
+    cur = current.astype(np.int16)
+    bg = background.astype(np.int16)
+    diff = (bg - cur) if polarity == "darker" else (cur - bg)
+    return np.clip(diff, 0, 255).astype(np.uint8)
+
+
 def detect_mouse(
     frame, background, arena, previous_point, previous_area,
     threshold, min_area, max_area, max_jump,
     roi_masks=None, use_window=False, window_size=120, window_weight=0.5,
-    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False
+    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False,
+    polarity="either"
 ):
     x1, y1, x2, y2 = arena
 
@@ -360,7 +379,7 @@ def detect_mouse(
 
     bg_crop = background[y1:y2, x1:x2]
     current_crop = current[y1:y2, x1:x2]
-    diff = cv2.absdiff(current_crop, bg_crop).astype(np.float32)
+    diff = _polarity_diff(current_crop, bg_crop, polarity).astype(np.float32)
     if color_mode == "rgb" and diff.ndim == 3:
         # Max across B/G/R rather than mean: catches an animal that stands
         # out strongly in just one channel (e.g. reddish fur on a green
@@ -526,7 +545,8 @@ def detect_mouse(
 
 
 def local_recovery(frame, background, previous_point, arena, threshold, min_area, max_area,
-                    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False):
+                    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False,
+                    polarity="either"):
     if previous_point is None:
         return None
 
@@ -546,7 +566,7 @@ def local_recovery(frame, background, previous_point, arena, threshold, min_area
     else:
         current = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
     bg = background[y1:y2, x1:x2]
-    diff = cv2.absdiff(current, bg)
+    diff = _polarity_diff(current, bg, polarity)
     if color_mode == "rgb" and diff.ndim == 3:
         diff = diff.max(axis=2)
 
@@ -636,7 +656,7 @@ def run_detection_preview(
     background, arena, roi_masks, roi_points, object_points,
     threshold, min_area, max_area, n_samples, output_dir, show_live=True,
     mask_polygons=None, exclusion_mask=None, color_mode="gray",
-    color_background=None, reject_shadows=False
+    color_background=None, reject_shadows=False, polarity="either"
 ):
     preview_dir = os.path.join(output_dir, "preview")
     os.makedirs(preview_dir, exist_ok=True)
@@ -661,7 +681,7 @@ def run_detection_preview(
             frame, background, arena, None, None,
             threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1),
             float("inf"), roi_masks=roi_masks, exclusion_mask=exclusion_mask, color_mode=color_mode,
-            color_background=color_background, reject_shadows=reject_shadows
+            color_background=color_background, reject_shadows=reject_shadows, polarity=polarity
         )
 
         disp = frame.copy()
@@ -783,6 +803,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
     color_mode = setup.get("color_mode", "gray")
     reject_shadows = setup.get("reject_shadows", False)
+    polarity = setup.get("polarity", "either")
 
     background = make_background(
         cap, start_frame, end_frame, matrix, warp_w, warp_h, setup["background_samples"],
@@ -816,7 +837,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         background, arena, detection_roi_masks, roi_points, object_points,
         threshold, min_area, max_area, setup["preview_samples"], output_dir, show_live=show_display,
         mask_polygons=mask_polygons, exclusion_mask=exclusion_mask, color_mode=color_mode,
-        color_background=color_background, reject_shadows=reject_shadows
+        color_background=color_background, reject_shadows=reject_shadows, polarity=polarity
     )
 
     # -----------------------------------------
@@ -853,7 +874,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             roi_masks=detection_roi_masks, use_window=use_window,
             window_size=window_size, window_weight=window_weight,
             exclusion_mask=exclusion_mask, color_mode=color_mode,
-            color_background=color_background, reject_shadows=reject_shadows
+            color_background=color_background, reject_shadows=reject_shadows, polarity=polarity
         )
 
         used_recovery = False
@@ -863,7 +884,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
                 frame, background, previous_point, arena,
                 threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1),
                 exclusion_mask=exclusion_mask, color_mode=color_mode,
-                color_background=color_background, reject_shadows=reject_shadows
+                color_background=color_background, reject_shadows=reject_shadows, polarity=polarity
             )
             used_recovery = candidate is not None
 
