@@ -24,6 +24,7 @@ from tracking.location import (
 )
 from tracking.two_mouse import track_video, save_preview_frames as save_preview_frames_multi_mouse
 from tracking.behavior import extract_features, classify_behaviors, save_preview_frames as save_preview_frames_behavior
+from tracking.boris_events import read_tracking_csv, generate_events, save_events
 
 
 def resource_path(relative_path):
@@ -1005,13 +1006,20 @@ class TrackerApp:
         # these back to the defaults below.
         self._remembered_start = ""
         self._remembered_end = ""
-        self._remembered_roi_names = "Light,Dark"
+        self._remembered_roi_names = ""
         self._last_built_mode = None
 
         root.title("BehavioralTracker")
         root.geometry("1550x980")
         root.minsize(1200, 760)
         root.resizable(True, True)
+        try:
+            root.state("zoomed")  # Windows: opens maximized by default
+        except tk.TclError:
+            try:
+                root.attributes("-zoomed", True)  # some Linux window managers
+            except tk.TclError:
+                root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
 
         try:
             icon_path = resource_path(os.path.join("resources", "icon.png"))
@@ -1358,6 +1366,7 @@ class TrackerApp:
         self.use_window_var = tk.BooleanVar(value=False)
         self.use_zone_threshold_var = tk.BooleanVar(value=False)
         self.reject_shadows_var = tk.BooleanVar(value=False)
+        self.exclude_objects_var = tk.BooleanVar(value=True)
         self.real_distance_entry = None
         self.units_entry = None
 
@@ -1390,6 +1399,16 @@ class TrackerApp:
                       "artifact invisible to detection instead of competing with the real animal.",
                       font=("Segoe UI", 7), foreground=MUTED, wraplength=255,
                       justify="left").pack(anchor="w", pady=(4, 0))
+
+            ttk.Checkbutton(settings_frame, text="Exclude marked objects from position detection",
+                            variable=self.exclude_objects_var).pack(anchor="w", pady=(10, 0))
+            ttk.Label(settings_frame, text="A marked object (e.g. a wire food-hopper cup) is a solid, "
+                      "static obstacle -- excluding its own outline stops it from ever being mistaken "
+                      "for the animal, without affecting whether the animal is detected as near it. "
+                      "Turn this off only if you drew a larger buffer zone around the object rather "
+                      "than tracing the object itself.",
+                      font=("Segoe UI", 7), foreground=MUTED, wraplength=255,
+                      justify="left").pack(anchor="w", padx=(18, 0))
         else:
             self.window_size_entry = None
             self.window_weight_entry = None
@@ -1737,10 +1756,10 @@ class TrackerApp:
         self.active_index = None
         self._remembered_start = ""
         self._remembered_end = ""
-        self._remembered_roi_names = "Light,Dark"
+        self._remembered_roi_names = ""
         self.start_entry.delete(0, tk.END)
         self.end_entry.delete(0, tk.END)
-        self.roi_names_entry.delete(0, tk.END); self.roi_names_entry.insert(0, "Light,Dark")
+        self.roi_names_entry.delete(0, tk.END)
         self.object_names_entry.delete(0, tk.END)
         self.output_size_entry.delete(0, tk.END)
         self.interact_var.set(False); self.entries_var.set(False)
@@ -1771,6 +1790,7 @@ class TrackerApp:
         self.use_zone_threshold_var.set(False)
         self.reject_shadows_var.set(False)
         self.polarity_var.set("either")
+        self.exclude_objects_var.set(True)
 
     def on_reset_all(self):
         if not messagebox.askyesno("Reset everything",
@@ -1781,10 +1801,10 @@ class TrackerApp:
         self.active_index = None
         self._remembered_start = ""
         self._remembered_end = ""
-        self._remembered_roi_names = "Light,Dark"
+        self._remembered_roi_names = ""
         self.start_entry.delete(0, tk.END)
         self.end_entry.delete(0, tk.END)
-        self.roi_names_entry.delete(0, tk.END); self.roi_names_entry.insert(0, "Light,Dark")
+        self.roi_names_entry.delete(0, tk.END)
         self.object_names_entry.delete(0, tk.END)
         self.output_size_entry.delete(0, tk.END)
         self.interact_var.set(False); self.entries_var.set(False)
@@ -1803,6 +1823,7 @@ class TrackerApp:
         self.use_zone_threshold_var.set(False)
         self.reject_shadows_var.set(False)
         self.polarity_var.set("either")
+        self.exclude_objects_var.set(True)
         self._refresh_video_list()
         self._render_canvas()
         self.status_label.config(text="Idle.")
@@ -2410,6 +2431,7 @@ class TrackerApp:
                 "use_zone_threshold": self.use_zone_threshold_var.get(),
                 "reject_shadows": self.reject_shadows_var.get(),
                 "polarity": self.polarity_var.get(),
+                "exclude_objects": self.exclude_objects_var.get(),
                 "use_window": self.use_window_var.get(),
                 "window_size": float(self.window_size_entry.get()),
                 "window_weight": float(self.window_weight_entry.get()),
@@ -2615,7 +2637,7 @@ class TrackerApp:
                 source_path, output_dir, n_samples=preview_n,
                 num_animals=self.num_animals, min_area=min_area, max_area=max_area,
                 diff_threshold=threshold, n_background_samples=bg_samples,
-                color_mode=self.color_mode_var.get(),
+                color_mode=self.color_mode_var.get(), progress_callback=self.on_progress,
             )
         except Exception as exc:
             messagebox.showerror("Reference frames failed", str(exc))
@@ -2740,6 +2762,7 @@ class TrackerApp:
                 source_path, output_dir, n_samples=preview_n, num_animals=self.num_animals,
                 min_area=min_area, max_area=max_area, diff_threshold=threshold,
                 n_background_samples=bg_samples, color_mode=self.color_mode_var.get(),
+                progress_callback=self.on_progress,
             )
         except Exception as exc:
             messagebox.showerror("Reference frames failed", str(exc))
@@ -2753,6 +2776,7 @@ class TrackerApp:
                 source_path, features_csv, num_animals=self.num_animals,
                 min_area=min_area, max_area=max_area, diff_threshold=threshold,
                 n_background_samples=bg_samples, color_mode=self.color_mode_var.get(),
+                progress_callback=self.on_progress,
             )
             self.status_label.config(text="Classifying behaviors...")
             self.root.update_idletasks()
@@ -2801,7 +2825,49 @@ class TrackerApp:
                   command=lambda: self._open_folder(self._last_output_dir)).pack(side="right")
         ttk.Button(top, text="New Analysis", style="Accent.TButton",
                   command=self._back_to_setup).pack(side="right", padx=(0, 8))
+        ttk.Button(top, text="Generate BORIS Events",
+                  command=self._on_generate_boris_events).pack(side="right", padx=(0, 8))
         ttk.Separator(self.body_container).pack(fill="x", pady=(0, 10))
+
+    def _on_generate_boris_events(self):
+        """BORIS (Behavioral Observation Research Interactive Software) is
+        a widely used tool for coding behavioral events; this writes a
+        simple subject/behavior/start/end event table many labs' further
+        analysis expects, generated from whichever tracking CSV this run
+        produced -- using the classified behavior label directly when one
+        exists (Behavior Classification), or movement speed and zone/
+        object proximity otherwise (Standard/Multi-Mouse Tracking)."""
+        output_dir = self._last_output_dir
+        candidates = ["labeled_frames.csv", "tracks.csv", "raw_tracking.csv"]
+        csv_path = None
+        for name in candidates:
+            p = os.path.join(output_dir, name)
+            if os.path.isfile(p):
+                csv_path = p
+                break
+        if csv_path is None:
+            messagebox.showerror("No tracking data", "Could not find a tracking CSV to generate events from.")
+            return
+        try:
+            rows = read_tracking_csv(csv_path)
+            events = generate_events(rows)
+            if not events:
+                messagebox.showinfo(
+                    "BORIS Events",
+                    "No events were generated -- the video may be too short, or nothing crossed the "
+                    "movement/freezing thresholds."
+                )
+                return
+            out_path = os.path.join(output_dir, "boris_events.csv")
+            save_events(events, out_path)
+            messagebox.showinfo(
+                "BORIS Events",
+                f"Saved {len(events)} events to:\n{out_path}\n\n"
+                "These are a starting point, not a final coding -- review them in BORIS or a "
+                "spreadsheet before treating them as ground truth."
+            )
+        except Exception as exc:
+            messagebox.showerror("BORIS Events failed", str(exc))
 
     def _open_folder(self, path):
         try:
