@@ -88,7 +88,7 @@ DEFAULTS = dict(
 # STAGE 1: DETECT
 # --------------------------------------------------------------------------
 
-def build_background(cap, n_samples=40, color_mode="gray"):
+def build_background(cap, n_samples=40, color_mode="gray", progress_callback=None):
     """Estimate a static background image as the per-pixel MEDIAN of frames
     sampled evenly through the video. This works because the mice move
     around: at any given pixel, most sampled frames show empty arena floor,
@@ -103,7 +103,7 @@ def build_background(cap, n_samples=40, color_mode="gray"):
     idxs = np.linspace(0, max(total - 1, 0), num=n_samples, dtype=int)
 
     frames = []
-    for i in idxs:
+    for pos, i in enumerate(idxs):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
         ok, frame = cap.read()
         if ok:
@@ -111,11 +111,55 @@ def build_background(cap, n_samples=40, color_mode="gray"):
                 frames.append(frame.astype(np.float32))
             else:
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
+        # Sampling means video seeks + decoding -- for a large/high-res
+        # video with many samples this can take several seconds with zero
+        # feedback, which looks and feels like the whole app has frozen.
+        # A callback here (the GUI wires this to a periodic screen
+        # refresh) keeps it visibly responsive during this phase too.
+        if progress_callback is not None:
+            progress_callback((pos + 1) / len(idxs))
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     if not frames:
         raise RuntimeError("Could not read any frames to build the background model.")
     return np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8)
+
+
+def _screen_size():
+    """Best-effort (width, height) of the primary screen. OpenCV has no
+    native way to ask this, so try a few approaches in order of
+    reliability and fall back to a common resolution if all of them fail
+    (e.g. no display attached at all)."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        pass
+    try:
+        import tkinter as _tk
+        _root = _tk.Tk()
+        _root.withdraw()
+        size = (_root.winfo_screenwidth(), _root.winfo_screenheight())
+        _root.destroy()
+        return size
+    except Exception:
+        return 1920, 1080
+
+
+def maximize_cv_window(name):
+    """Size and position a cv2 window to fill the screen -- OpenCV has no
+    native 'maximize' the way the main Tkinter window does, so this
+    approximates it, keeping every popup window looking consistent with
+    the main app opening maximized. Call this ONCE per window, before the
+    first imshow() in whatever loop uses it, not on every frame."""
+    try:
+        w, h = _screen_size()
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(name, w, h)
+        cv2.moveWindow(name, 0, 0)
+    except Exception:
+        pass  # never let a display quirk break tracking itself
 
 
 def foreground_mask(frame, background, diff_threshold, morph_kernel, color_mode="gray"):
@@ -209,7 +253,7 @@ def match_identities(prev_centroids, curr_centroids):
 # REFERENCE / CALIBRATION PREVIEW FRAMES
 # --------------------------------------------------------------------------
 
-def save_preview_frames(video_path, output_dir, n_samples=6, **overrides):
+def save_preview_frames(video_path, output_dir, n_samples=6, progress_callback=None, **overrides):
     """Save a handful of sample frames evenly spaced across the video, each
     annotated with the detected animal(s) at that frame -- lets you
     sanity-check min/max area and the difference threshold before (or
@@ -223,7 +267,8 @@ def save_preview_frames(video_path, output_dir, n_samples=6, **overrides):
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     n_animals = cfg["num_animals"]
 
-    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"])
+    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"],
+                                   progress_callback=progress_callback)
 
     preview_dir = os.path.join(output_dir, "preview")
     os.makedirs(preview_dir, exist_ok=True)
@@ -286,7 +331,8 @@ def track_video(video_path, output_csv, annotate_path=None, progress_callback=No
     n_animals = cfg["num_animals"]
 
     print("Building background model...")
-    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"])
+    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"],
+                                   progress_callback=progress_callback)
 
     writer = None
     if annotate_path:
@@ -301,6 +347,9 @@ def track_video(video_path, output_csv, annotate_path=None, progress_callback=No
     stopped_early = False
 
     frame_iter = range(n_frames) if (show_display or progress_callback) else tqdm(range(n_frames), desc="Tracking")
+
+    if show_display:
+        maximize_cv_window("MULTI-MOUSE TRACKING - Q to stop")
 
     for frame_idx in frame_iter:
         ok, frame = cap.read()

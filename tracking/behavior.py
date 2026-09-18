@@ -71,7 +71,7 @@ import pandas as pd
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
-from tracking.two_mouse import build_background, foreground_mask, DEFAULTS as TRACKER_DEFAULTS
+from tracking.two_mouse import build_background, foreground_mask, maximize_cv_window, DEFAULTS as TRACKER_DEFAULTS
 
 DEFAULTS = dict(
     **TRACKER_DEFAULTS,
@@ -175,7 +175,8 @@ def local_motion_energy(gray_prev, gray_curr, center, roi_size):
     return float(np.abs(curr_patch - prev_patch).mean())
 
 
-def _load_background(video_path, background_source, n_background_samples, color_mode="gray"):
+def _load_background(video_path, background_source, n_background_samples, color_mode="gray",
+                      progress_callback=None):
     """Background estimation is only reliable if the animal moves around
     enough during sampling that no pixel is 'mouse' most of the time. That
     assumption breaks for low-mobility footage -- e.g. a session with long
@@ -186,7 +187,8 @@ def _load_background(video_path, background_source, n_background_samples, color_
     background than auto-sampling from the animal's own video."""
     if background_source is None:
         cap = cv2.VideoCapture(str(video_path))
-        bg = build_background(cap, n_background_samples, color_mode=color_mode)
+        bg = build_background(cap, n_background_samples, color_mode=color_mode,
+                               progress_callback=progress_callback)
         cap.release()
         return bg
 
@@ -200,12 +202,14 @@ def _load_background(video_path, background_source, n_background_samples, color_
     cap = cv2.VideoCapture(str(background_source))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open background source video: {background_source}")
-    bg = build_background(cap, n_background_samples, color_mode=color_mode)
+    bg = build_background(cap, n_background_samples, color_mode=color_mode,
+                           progress_callback=progress_callback)
     cap.release()
     return bg
 
 
-def save_preview_frames(video_path, output_dir, n_samples=6, background_source=None, **overrides):
+def save_preview_frames(video_path, output_dir, n_samples=6, background_source=None,
+                         progress_callback=None, **overrides):
     """Save a handful of sample frames evenly spaced across the video, each
     annotated with the detected animal(s) at that frame -- lets you
     sanity-check min/max area and the difference threshold before running
@@ -221,7 +225,7 @@ def save_preview_frames(video_path, output_dir, n_samples=6, background_source=N
     cap.release()
 
     background = _load_background(video_path, background_source, cfg["n_background_samples"],
-                                   color_mode=cfg["color_mode"])
+                                   color_mode=cfg["color_mode"], progress_callback=progress_callback)
 
     preview_dir = os.path.join(output_dir, "preview")
     os.makedirs(preview_dir, exist_ok=True)
@@ -282,7 +286,7 @@ def extract_features(video_path, output_csv, background_source=None, progress_ca
 
     print("Building background model...")
     background = _load_background(video_path, background_source, cfg["n_background_samples"],
-                                   color_mode=cfg["color_mode"])
+                                   color_mode=cfg["color_mode"], progress_callback=progress_callback)
 
     records = []
     prev_items = None
@@ -292,6 +296,9 @@ def extract_features(video_path, output_csv, background_source=None, progress_ca
 
     frame_iter = range(n_frames) if (show_display or progress_callback) \
         else tqdm(range(n_frames), desc="Extracting features")
+
+    if show_display:
+        maximize_cv_window("BEHAVIOR FEATURE EXTRACTION - Q to stop")
 
     for frame_idx in frame_iter:
         ok, frame = cap.read()
