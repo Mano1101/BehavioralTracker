@@ -88,7 +88,7 @@ DEFAULTS = dict(
 # STAGE 1: DETECT
 # --------------------------------------------------------------------------
 
-def build_background(cap, n_samples=40, color_mode="gray"):
+def build_background(cap, n_samples=40, color_mode="gray", progress_callback=None):
     """Estimate a static background image as the per-pixel MEDIAN of frames
     sampled evenly through the video. This works because the mice move
     around: at any given pixel, most sampled frames show empty arena floor,
@@ -103,7 +103,7 @@ def build_background(cap, n_samples=40, color_mode="gray"):
     idxs = np.linspace(0, max(total - 1, 0), num=n_samples, dtype=int)
 
     frames = []
-    for i in idxs:
+    for pos, i in enumerate(idxs):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
         ok, frame = cap.read()
         if ok:
@@ -111,11 +111,55 @@ def build_background(cap, n_samples=40, color_mode="gray"):
                 frames.append(frame.astype(np.float32))
             else:
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
+        # Sampling means video seeks + decoding -- for a large/high-res
+        # video with many samples this can take several seconds with zero
+        # feedback, which looks and feels like the whole app has frozen.
+        # A callback here (the GUI wires this to a periodic screen
+        # refresh) keeps it visibly responsive during this phase too.
+        if progress_callback is not None:
+            progress_callback((pos + 1) / len(idxs))
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     if not frames:
         raise RuntimeError("Could not read any frames to build the background model.")
     return np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8)
+
+
+def _screen_size():
+    """Best-effort (width, height) of the primary screen. OpenCV has no
+    native way to ask this, so try a few approaches in order of
+    reliability and fall back to a common resolution if all of them fail
+    (e.g. no display attached at all)."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        pass
+    try:
+        import tkinter as _tk
+        _root = _tk.Tk()
+        _root.withdraw()
+        size = (_root.winfo_screenwidth(), _root.winfo_screenheight())
+        _root.destroy()
+        return size
+    except Exception:
+        return 1920, 1080
+
+
+def maximize_cv_window(name):
+    """Size and position a cv2 window to fill the screen -- OpenCV has no
+    native 'maximize' the way the main Tkinter window does, so this
+    approximates it, keeping every popup window looking consistent with
+    the main app opening maximized. Call this ONCE per window, before the
+    first imshow() in whatever loop uses it, not on every frame."""
+    try:
+        w, h = _screen_size()
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(name, w, h)
+        cv2.moveWindow(name, 0, 0)
+    except Exception:
+        pass  # never let a display quirk break tracking itself
 
 
 def foreground_mask(frame, background, diff_threshold, morph_kernel, color_mode="gray"):
@@ -191,15 +235,36 @@ def get_centroids(mask, min_area, max_area, num_animals=2):
 # STAGE 3: IDENTIFY (Hungarian algorithm)
 # --------------------------------------------------------------------------
 
-def match_identities(prev_centroids, curr_centroids):
+def match_identities(prev_centroids, curr_centroids, velocities=None):
     """Reorder curr_centroids to best match prev_centroids' identities by
-    minimizing total displacement (Hungarian / linear sum assignment)."""
-    cost = np.zeros((len(prev_centroids), len(curr_centroids)))
-    for i, p in enumerate(prev_centroids):
+    minimizing total displacement (Hungarian / linear sum assignment).
+
+    When velocities (per-animal (vx, vy), estimated from the last
+    confirmed movement) are supplied, matching is done against each
+    animal's PREDICTED position (previous position + velocity) instead of
+    its last position -- a constant-velocity motion model, the same core
+    idea behind classical multi-object trackers like SORT. This keeps
+    identity correct through fast movement or when two animals cross
+    paths, where "whichever blob is closest to where it WAS" can
+    otherwise latch onto the wrong animal at the crossing point."""
+    n_prev = len(prev_centroids)
+    if velocities is not None and len(velocities) == n_prev:
+        predicted = [(p[0] + v[0], p[1] + v[1]) for p, v in zip(prev_centroids, velocities)]
+    else:
+        predicted = list(prev_centroids)
+
+    cost = np.zeros((n_prev, len(curr_centroids)))
+    for i, p in enumerate(predicted):
         for j, c in enumerate(curr_centroids):
             cost[i, j] = np.hypot(p[0] - c[0], p[1] - c[1])
     row_ind, col_ind = linear_sum_assignment(cost)
-    ordered = list(prev_centroids)  # fallback: hold last position if unmatched
+    # Fallback for an unmatched identity (fewer detections than animals,
+    # e.g. two animals briefly merged into one blob): keep advancing its
+    # PREDICTED position via its last known velocity, not the stale
+    # pre-merge position -- otherwise it's frozen exactly while the motion
+    # model is most needed, and the two identities are much more likely to
+    # swap once the blobs separate and matching resumes.
+    ordered = list(predicted)
     for r, c in zip(row_ind, col_ind):
         ordered[r] = curr_centroids[c]
     return ordered
@@ -209,7 +274,7 @@ def match_identities(prev_centroids, curr_centroids):
 # REFERENCE / CALIBRATION PREVIEW FRAMES
 # --------------------------------------------------------------------------
 
-def save_preview_frames(video_path, output_dir, n_samples=6, **overrides):
+def save_preview_frames(video_path, output_dir, n_samples=6, progress_callback=None, **overrides):
     """Save a handful of sample frames evenly spaced across the video, each
     annotated with the detected animal(s) at that frame -- lets you
     sanity-check min/max area and the difference threshold before (or
@@ -223,7 +288,8 @@ def save_preview_frames(video_path, output_dir, n_samples=6, **overrides):
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     n_animals = cfg["num_animals"]
 
-    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"])
+    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"],
+                                   progress_callback=progress_callback)
 
     preview_dir = os.path.join(output_dir, "preview")
     os.makedirs(preview_dir, exist_ok=True)
@@ -286,7 +352,8 @@ def track_video(video_path, output_csv, annotate_path=None, progress_callback=No
     n_animals = cfg["num_animals"]
 
     print("Building background model...")
-    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"])
+    background = build_background(cap, cfg["n_background_samples"], color_mode=cfg["color_mode"],
+                                   progress_callback=progress_callback)
 
     writer = None
     if annotate_path:
@@ -298,9 +365,14 @@ def track_video(video_path, output_csv, annotate_path=None, progress_callback=No
 
     records = []
     prev_centroids = None
+    prev_confirmed_centroids = None  # last GENUINE detection (not a held/lost frame)
+    velocities = None
     stopped_early = False
 
     frame_iter = range(n_frames) if (show_display or progress_callback) else tqdm(range(n_frames), desc="Tracking")
+
+    if show_display:
+        maximize_cv_window("MULTI-MOUSE TRACKING - Q to stop")
 
     for frame_idx in frame_iter:
         ok, frame = cap.read()
@@ -318,15 +390,24 @@ def track_video(video_path, output_csv, annotate_path=None, progress_callback=No
             if prev_centroids is None:
                 curr = (detected + [detected[0]])[:n_animals]
             else:
-                curr = match_identities(prev_centroids, detected)
+                curr = match_identities(prev_centroids, detected, velocities=velocities)
             flag = "partial"
         else:
             if prev_centroids is None:
                 detected = sorted(detected, key=lambda p: p[0])  # seed left-to-right
                 curr = detected[:n_animals]
             else:
-                curr = match_identities(prev_centroids, detected)
+                curr = match_identities(prev_centroids, detected, velocities=velocities)
             flag = "ok"
+
+        # Velocity is estimated only between two GENUINE detections, never
+        # across a held/lost frame -- otherwise a brief tracking gap would
+        # reset the estimate to zero right when the motion model is most
+        # useful for picking the identities back up correctly.
+        if flag in ("ok", "partial") and prev_confirmed_centroids is not None:
+            velocities = [(c[0] - p[0], c[1] - p[1]) for c, p in zip(curr, prev_confirmed_centroids)]
+        if flag in ("ok", "partial"):
+            prev_confirmed_centroids = curr
 
         prev_centroids = curr
 
