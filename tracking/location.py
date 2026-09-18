@@ -254,43 +254,6 @@ def draw_crosshair(display, center, size=9, color=(0, 0, 255), thickness=2):
     cv2.line(display, (x, y - size), (x, y + size), color, thickness, cv2.LINE_AA)
 
 
-def _screen_size():
-    """Best-effort (width, height) of the primary screen. OpenCV has no
-    native way to ask this, so try a few approaches in order of
-    reliability and fall back to a common resolution if all of them fail
-    (e.g. no display attached at all)."""
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-    except Exception:
-        pass
-    try:
-        import tkinter as _tk
-        _root = _tk.Tk()
-        _root.withdraw()
-        size = (_root.winfo_screenwidth(), _root.winfo_screenheight())
-        _root.destroy()
-        return size
-    except Exception:
-        return 1920, 1080
-
-
-def maximize_cv_window(name):
-    """Size and position a cv2 window to fill the screen -- OpenCV has no
-    native 'maximize' the way the main Tkinter window does, so this
-    approximates it, keeping every popup window looking consistent with
-    the main app opening maximized. Call this ONCE per window, before the
-    first imshow() in whatever loop uses it, not on every frame."""
-    try:
-        w, h = _screen_size()
-        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(name, w, h)
-        cv2.moveWindow(name, 0, 0)
-    except Exception:
-        pass  # never let a display quirk break tracking itself
-
-
 def draw_mask_polygons(display, mask_polygons, color=(0, 0, 0)):
     """Draw excluded (masked-out) regions as black outlines with a light
     hatch fill, so they're visibly distinct from zones/objects."""
@@ -318,8 +281,7 @@ def build_exclusion_mask(shape_hw, mask_polygons):
 # -----------------------------
 
 
-def make_background(cap, start_frame, end_frame, matrix, warp_w, warp_h, sample_count=100, color_mode="gray",
-                     progress_callback=None):
+def make_background(cap, start_frame, end_frame, matrix, warp_w, warp_h, sample_count=100, color_mode="gray"):
     sample_count = max(1, int(sample_count))
 
     if end_frame <= start_frame:
@@ -331,7 +293,7 @@ def make_background(cap, start_frame, end_frame, matrix, warp_w, warp_h, sample_
     print("\nBuilding automatic background model...")
     print(f"Sampling {len(positions)} frames (median-based). This may take a little time.")
 
-    for i, frame_number in enumerate(positions):
+    for frame_number in positions:
         frame = read_and_warp(cap, frame_number, matrix, warp_w, warp_h)
 
         if frame is None:
@@ -343,14 +305,6 @@ def make_background(cap, start_frame, end_frame, matrix, warp_w, warp_h, sample_
             sample = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             sample = cv2.GaussianBlur(sample, (5, 5), 0)
         samples.append(sample)
-
-        # Sampling means video seeks + decoding -- for a large/high-res
-        # video with many samples this can take several seconds with zero
-        # feedback, which looks and feels like the whole app has frozen.
-        # A callback here (the GUI wires this to a periodic screen
-        # refresh) keeps it visibly responsive during this phase too.
-        if progress_callback is not None:
-            progress_callback((i + 1) / len(positions))
 
     if not samples:
         raise RuntimeError("Could not build background model.")
@@ -716,7 +670,6 @@ def run_detection_preview(
     print(f"\nSaving {len(positions)} calibration preview frame(s) to:\n{preview_dir}")
     if show_live:
         print("Press any key to advance, ESC to cancel and retune.")
-        maximize_cv_window("Detection preview")
 
     for i, pframe in enumerate(positions, start=1):
         frame = read_and_warp(cap, pframe, matrix, warp_w, warp_h)
@@ -831,22 +784,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
     behavior_names = setup.get("behavior_names", [])
 
     mask_polygons = setup.get("mask_points", [])
-    # A marked object (e.g. a wire food-hopper cup used for a sociability
-    # test) is a physical, static structure -- it should never itself be
-    # mistaken for the animal during position detection, only used to test
-    # whether the animal's tracked position is near it. So its outline
-    # also excludes it from detection, exactly like an explicit Mask Zone,
-    # while object_masks (built above) is unaffected and still used for
-    # the actual proximity/interaction test. Toggleable in case someone
-    # draws a larger buffer zone around the object instead of tracing the
-    # object's own solid footprint (which the animal actually can walk
-    # through, so excluding it would wrongly hide the animal there).
-    exclude_objects = setup.get("exclude_objects", True)
-    detection_exclusion_polygons = list(mask_polygons)
-    if exclude_objects:
-        detection_exclusion_polygons += list(object_points.values())
-    exclusion_mask = build_exclusion_mask((warp_h, warp_w), detection_exclusion_polygons) \
-        if detection_exclusion_polygons else None
+    exclusion_mask = build_exclusion_mask((warp_h, warp_w), mask_polygons) if mask_polygons else None
 
     threshold = setup["threshold"]
     min_area = setup["min_area"]
@@ -869,7 +807,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
     background = make_background(
         cap, start_frame, end_frame, matrix, warp_w, warp_h, setup["background_samples"],
-        color_mode=color_mode, progress_callback=progress_callback
+        color_mode=color_mode
     )
 
     # Shadow rejection needs a COLOR reference regardless of color_mode --
@@ -879,11 +817,10 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
     if reject_shadows and color_background is None:
         color_background = make_background(
             cap, start_frame, end_frame, matrix, warp_w, warp_h, setup["background_samples"],
-            color_mode="rgb", progress_callback=progress_callback
+            color_mode="rgb"
         )
 
     if show_display:
-        maximize_cv_window("Automatic background - press ENTER")
         cv2.imshow("Automatic background - press ENTER", background)
         while True:
             key = cv2.waitKey(30) & 0xFF
@@ -920,7 +857,6 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
     print("\nStarting automatic tracking...")
     if show_display:
         print("Press Q during tracking to stop.")
-        maximize_cv_window("BEHAVIORAL TRACKING - Q to stop")
 
     while frame_number <= end_frame:
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
