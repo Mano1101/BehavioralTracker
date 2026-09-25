@@ -1,9 +1,16 @@
 """
 Headless regression test for the Qt app's core UI: header, Quick Setup,
-the interactive preview canvas (crop/mask/zones/objects/distance/maze-
-template-rename), analysis-type switching, Results page navigation, and
-Save/Open Project round-tripping. Covers the ground built in Task #23-25
-of the PySide6 rewrite (see README.md's "Remaining roadmap").
+the interactive preview canvas (crop/mask/zones/objects/distance),
+analysis-type switching, Results page navigation, and Save/Open Project
+round-tripping. Covers the ground built in Task #23-25 of the PySide6
+rewrite (see README.md's "Remaining roadmap").
+
+Quick Setup apparatus tiles just start an ordinary 'zones' op tagged with
+a template_key now (the old drag-corners 'template_zones' flow they used
+to start is gone -- see test_maze_templates.py for full suggestion-order
+coverage of that). The 'template_zones' op kind itself lives on, but only
+for the Batch queue's per-video "Align" feature -- see test_batch_features.py
+for its drag-corner/rename coverage.
 
 Run directly (needs a virtual display -- see _pathsetup.py's docstring):
     xvfb-run -a python3.12 qt_app/tests/test_canvas_smoke.py
@@ -12,7 +19,7 @@ import _pathsetup  # noqa: F401 (bare import -- see its docstring; sets sys.path
 
 import sys, os, json, tempfile
 
-from PySide6.QtWidgets import QApplication, QMessageBox, QLineEdit, QComboBox, QCheckBox, QLabel
+from PySide6.QtWidgets import QApplication, QMessageBox, QLineEdit, QCheckBox, QLabel
 from PySide6.QtCore import Qt
 
 # Headless run: any real QMessageBox.exec() would block forever waiting for
@@ -115,15 +122,14 @@ check("pending_matrix set after No Crop", win.pending_matrix is not None)
 
 win.quick_setup_template("open_field")
 app.processEvents()
-check("quick_setup_template starts an interactive template_zones op (doesn't commit directly)",
-      win._op is not None and win._op["kind"] == "template_zones")
-check("pending_roi_points NOT yet set before Finish", win.pending_roi_points == {})
-win.finish_op()
+check("quick_setup_template starts a normal 'zones' op tagged with its template key "
+      "(not the old drag-corners template_zones flow)",
+      win._op is not None and win._op["kind"] == "zones" and win._op.get("template_key") == "open_field")
+check("pending_roi_points NOT yet set before any shape is drawn", win.pending_roi_points == {})
+win.cancel_op()
 app.processEvents()
-check("Finish commits quick_setup_template's zones", bool(win.pending_roi_points))
-check("roi_names_entry synced with generated zone names",
-      bool(win.setup_page.roi_names_entry.text().strip()))
-check("_op cleared after Finish", win._op is None)
+check("cancel_op left pending_roi_points untouched", win.pending_roi_points == {})
+check("_op cleared after cancel", win._op is None)
 
 # ------------------------------------------------------------------
 # 3b) Interactive Crop Arena: click 4 corners, drag one, Finish
@@ -250,14 +256,15 @@ check("cancel_op cleared _op", win._op is None)
 check("cancel_op did not touch pending_object_points", win.pending_object_points == saved_objects)
 
 # ------------------------------------------------------------------
-# 3h) Maze Template zone rename via the explicit op-bar button (NOT a
-# canvas click -- MM's video showed that on a real EPM recording, the
-# arm/center zones overlap and are only a few px wide, so an ordinary
-# alignment click easily landed inside a DIFFERENT zone and popped up its
-# rename dialog by surprise. Canvas clicks are drag-only now; renaming
-# only happens via rebuild_template_zone_buttons()'s per-zone button. The
-# dialog itself is a blocking QDialog.exec(), so patch the module-level
-# function headlessly.
+# 3h) Zone rename dialog plumbing (zone_label_dialog.prompt_zone_label) --
+# it's a blocking QDialog.exec(), so patch the module-level function
+# headlessly once here; reused by the Draw Zones auto-naming checks below.
+# (This used to also cover Maze Template's op-bar rename button and
+# corner-dragging via a drag-only 'template_zones' op -- that flow is gone
+# now that Quick Setup tiles draw zones the same way Draw Zones does; see
+# test_maze_templates.py for its suggestion-order coverage. 'template_zones'
+# itself lives on only for the Batch queue's per-video "Align" feature --
+# see test_batch_features.py for its drag-corner/rename coverage.)
 # ------------------------------------------------------------------
 import qt_app.dialogs.zone_label_dialog as zone_label_dialog
 rename_calls = []
@@ -270,57 +277,13 @@ def fake_prompt(parent, current_name, suggestions, existing_names):
 
 zone_label_dialog.prompt_zone_label = fake_prompt
 
-win.quick_setup_template("open_field")
-app.processEvents()
-check("quick_setup_template (again) starts a template_zones op",
-      win._op is not None and win._op["kind"] == "template_zones")
-first_zone = next(iter(win._op["regions"].keys()))
-first_pts = win._op["regions"][first_zone]
-cx = sum(p[0] for p in first_pts) / len(first_pts)
-cy = sum(p[1] for p in first_pts) / len(first_pts)
-win.on_canvas_press(cx, cy)
-check("clicking inside a generated zone's INTERIOR (away from any corner) does nothing now",
-      rename_calls == [] and first_zone in win._op["regions"])
-win.op_rename_template_zone(first_zone)
-check("the per-zone op-bar button opened the rename dialog", rename_calls == [first_zone])
-check("zone renamed inside the op",
-      "Renamed Zone" in win._op["regions"] and first_zone not in win._op["regions"])
-win.finish_op()
-check("Finish committed the renamed zone", "Renamed Zone" in win.pending_roi_points)
-check("roi_names_entry synced with the renamed zone",
-      "Renamed Zone" in win.setup_page.roi_names_entry.text())
-
-# ------------------------------------------------------------------
-# 3h-2) Maze Template corner-dragging: a generated zone's geometry can be
-# off from the real maze (camera angle/zoom per rig), so a click NEAR one
-# of its corners should drag that corner -- same interaction as
-# crop/zones/objects/distance. Start a fresh template_zones op (the
-# previous one was already Finish()ed above).
-# ------------------------------------------------------------------
-rename_calls.clear()
-win.quick_setup_template("open_field")
-app.processEvents()
-check("fresh template_zones op started for the drag test", win._op is not None and win._op["kind"] == "template_zones")
-drag_zone = next(iter(win._op["regions"].keys()))
-drag_pts_before = list(win._op["regions"][drag_zone])
-corner_x, corner_y = drag_pts_before[0]
-win.on_canvas_press(corner_x, corner_y)
-check("clicking ON a generated zone's corner starts a drag",
-      win._op["drag"] == ("region", drag_zone, 0) and rename_calls == [])
-win.on_canvas_drag(corner_x + 15, corner_y - 15)
-check("dragging moved that corner", win._op["regions"][drag_zone][0] == (corner_x + 15, corner_y - 15))
-win.on_canvas_release()
-check("release cleared the drag", win._op["drag"] is None)
-win.finish_op()
-check("Finish committed the dragged corner", win.pending_roi_points[drag_zone][0] == (corner_x + 15, corner_y - 15))
-
 # ------------------------------------------------------------------
 # 3h-3) Draw Zones: 'New Zone' adds an auto-named zone without needing to
 # know all names up front, a click near ANY zone's corner drags it (not
 # just the active one), and clicking INSIDE a different, already-finished
 # zone opens the rename popup instead of adding a point to the active
-# region -- the same "draw first, name after" capability Maze Template
-# already had, now also in the manual Draw Zones tool.
+# region -- this same "draw first, name after" interaction is also what
+# Quick Setup apparatus tiles drive now (see test_maze_templates.py).
 # ------------------------------------------------------------------
 win.setup_page.roi_names_entry.setText("A")
 win.start_op("zones")
@@ -462,14 +425,86 @@ win.cancel_op()
 app.processEvents()
 
 # ------------------------------------------------------------------
-# 4) output_size_entry Combobox + memory persistence
+# 4) Dark mode removed entirely (MM asked for this to go, not just be
+# hidden) -- no toggle button, no theme module to switch, one fixed
+# palette everywhere.
 # ------------------------------------------------------------------
-check("output_size_entry is a QComboBox", isinstance(win.setup_page.output_size_entry, QComboBox))
-check("output_size_entry defaults to 'Same as input'",
-      win.setup_page.output_size_entry.currentText() == "Same as input")
-win.setup_page.output_size_entry.setCurrentText("1280x720")
-win.setup_page.save_all_to_memory(include_calibration=False)
-check("Combobox value persisted to memory", win._memory.get("output_size_entry") == "1280x720")
+check("no theme toggle button on the header anymore", not hasattr(win, "theme_toggle_btn"))
+check("no dark_mode flag on MainWindow anymore", not hasattr(win, "dark_mode"))
+
+# ------------------------------------------------------------------
+# 4b) Draw Zones with roi_names_entry left BLANK: starts with one
+# auto-named zone ready to draw, and finishing a Rectangle/Ellipse/Line
+# shape immediately asks for its real name (then gets ready for the next
+# one) instead of requiring every name to be typed up front -- MM's ask
+# after sketching lines straight onto a maze frame and naming each as he
+# drew it. The rename dialog is a blocking QDialog.exec(), so patch the
+# module-level function headlessly (already done above, in 3h).
+# ------------------------------------------------------------------
+rename_calls.clear()
+naming_queue = ["Open Arm", "Closed Arm"]
+
+
+def fake_prompt_sequence(parent, current_name, suggestions, existing_names):
+    rename_calls.append(current_name)
+    return naming_queue.pop(0) if naming_queue else None
+
+
+zone_label_dialog.prompt_zone_label = fake_prompt_sequence
+
+win.setup_page.roi_names_entry.setText("")
+win.start_op("zones")
+check("blank roi_names_entry still starts a zones op with one ready-to-draw zone",
+      win._op is not None and list(win._op["regions"].keys()) == ["Zone 1"])
+check("that first zone is tracked as auto-named (not a real typed name yet)",
+      win._op["auto_named"] == {"Zone 1"})
+
+win.op_set_draw_mode("line")
+win.on_canvas_press(500, 10)
+win.on_canvas_drag(500, 110)
+win.on_canvas_release()
+check("finishing the line prompted for a name", rename_calls == ["Zone 1"])
+check("the shape was renamed to what the dialog returned",
+      "Open Arm" in win._op["regions"] and len(win._op["regions"]["Open Arm"]) == 4)
+check("a fresh EMPTY auto-named zone is ready immediately after, no extra 'New Zone' click needed "
+      "(reusing the 'Zone 1' name now that the old one moved to 'Open Arm')",
+      win._op["active_region"] != "Open Arm" and win._op["active_region"] in win._op["auto_named"]
+      and win._op["regions"][win._op["active_region"]] == [])
+
+second_placeholder = win._op["active_region"]
+win.on_canvas_press(600, 10)
+win.on_canvas_drag(600, 110)
+win.on_canvas_release()
+check("finishing the second line prompted again", rename_calls == ["Zone 1", second_placeholder])
+check("second shape renamed too", "Closed Arm" in win._op["regions"])
+
+# Leave the trailing auto-created placeholder undrawn and Finish anyway --
+# it should be dropped silently rather than blocking with "needs 3+ points".
+trailing_placeholder = win._op["active_region"]
+check("a trailing empty placeholder exists before Finish",
+      trailing_placeholder in win._op["regions"] and win._op["regions"][trailing_placeholder] == [])
+mb_calls.clear()
+win.finish_op()
+check("Finish did not complain about the never-drawn trailing placeholder", mb_calls == [])
+check("only the two actually-drawn, real-named zones were committed",
+      set(win.pending_roi_points.keys()) == {"Open Arm", "Closed Arm"})
+check("roi_names_entry synced with the real zone names even though it started blank",
+      set(n.strip() for n in win.setup_page.roi_names_entry.text().split(",")) == {"Open Arm", "Closed Arm"})
+
+# Pre-typed names still skip the auto-prompt entirely (backward compatible
+# -- exercised already by section 3h-4 above, confirmed again here briefly).
+rename_calls.clear()
+win.setup_page.roi_names_entry.setText("Typed Zone")
+win.start_op("zones")
+check("a zone typed into roi_names_entry is NOT auto-named",
+      win._op["auto_named"] == set())
+win.op_set_draw_mode("rectangle")
+win.on_canvas_press(700, 10)
+win.on_canvas_drag(740, 50)
+win.on_canvas_release()
+check("finishing a pre-named zone's shape does NOT pop the rename dialog",
+      rename_calls == [])
+win.cancel_op()
 
 # ------------------------------------------------------------------
 # 5) Switch to Multi-Mouse and Behavior Classification, verify rebuild
@@ -488,8 +523,8 @@ win._set_analysis_type("behavior")
 app.processEvents()
 all_text = widget_texts(win.setup_page)
 check("No Quick Setup section in Behavior Classification", not any("Quick Setup" in t for t in all_text))
-check("output_size_entry is a Combobox in behavior mode",
-      isinstance(win.setup_page.output_size_entry, QComboBox))
+check("No 'Video output size' control anywhere (removed app-wide)",
+      not any("Video output size" in t for t in all_text) and not hasattr(win.setup_page, "output_size_entry"))
 check("ML classifier panel present in behavior mode",
       any("Deep Learning Classifier" in t for t in all_text))
 check("Manual Scoring button present", any("MANUAL SCORING" in t for t in all_text))

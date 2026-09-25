@@ -17,7 +17,7 @@ every file in this suite -- see _pathsetup.py's docstring):
 
 Pass one or more names (with or without .py) to run a subset, e.g.:
 
-    xvfb-run -a python3.12 qt_app/tests/run_all.py test_maze_template_dialog test_ml_pipeline
+    xvfb-run -a python3.12 qt_app/tests/run_all.py test_maze_templates test_ml_pipeline
 """
 import os
 import subprocess
@@ -31,7 +31,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(TESTS_DIR))
 # so a quick regression in an earlier area fails fast.
 ORDERED_TESTS = [
     "test_canvas_smoke.py",
-    "test_maze_template_dialog.py",
+    "test_maze_templates.py",
     "test_start_tracking.py",
     "test_manual_scoring.py",
     "test_batch_features.py",
