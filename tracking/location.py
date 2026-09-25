@@ -826,7 +826,16 @@ def compute_output_dir(video_path):
 # -----------------------------
 
 
-def process_single_video(video_path, setup, show_display=True, progress_callback=None, confirm_callback=None):
+def process_single_video(video_path, setup, show_display=True, progress_callback=None, confirm_callback=None,
+                          frame_callback=None):
+    """frame_callback(display_bgr), if given, is handed the SAME annotated
+    frame that show_display=True would otherwise put in a cv2.imshow
+    window -- used by the Qt app to draw a live tracking view inside its
+    own preview canvas instead (see the show_display branch below for why
+    cv2.imshow itself can't be used there: it hard-crashes when a Qt5
+    OpenCV build and this PySide6/Qt6 app are both active in the same
+    process). Called on the same throttled cadence as progress_callback,
+    independent of show_display."""
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -1110,7 +1119,12 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
         rows.append(row)
 
-        if show_display:
+        # Built every frame when show_display=True (a live cv2 window needs
+        # each frame redrawn), or every 5th frame -- matching
+        # progress_callback's own cadence below -- when only frame_callback
+        # wants an occasional snapshot for the Qt live tracking view.
+        build_display = show_display or (frame_callback is not None and (frame_number + 1) % 5 == 0)
+        if build_display:
             display = frame.copy()
             cv2.rectangle(display, (arena[0], arena[1]), (arena[2], arena[3]), (255, 255, 0), 1)
             if mask_polygons:
@@ -1145,12 +1159,13 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             cv2.putText(display, f"Frame: {frame_number}", (20, 105),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
 
-            cv2.imshow("BEHAVIORAL TRACKING - Q to stop", display)
-            key = cv2.waitKey(1) & 0xFF
+            if show_display:
+                cv2.imshow("BEHAVIORAL TRACKING - Q to stop", display)
+                key = cv2.waitKey(1) & 0xFF
 
-            if key == ord("q"):
-                print("\nTracking stopped by user.")
-                break
+                if key == ord("q"):
+                    print("\nTracking stopped by user.")
+                    break
 
         frame_number += 1
         previous_time = current_time
@@ -1158,6 +1173,8 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         if progress_callback is not None and frame_number % 5 == 0:
             span = max(1, end_frame - start_frame)
             progress_callback(min(1.0, (frame_number - start_frame) / span))
+        if frame_callback is not None and build_display and frame_number % 5 == 0:
+            frame_callback(display)
     cap.release()
     if show_display:
         cv2.destroyAllWindows()
