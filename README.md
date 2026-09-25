@@ -12,8 +12,9 @@ selection.
 The app was rebuilt from Tkinter to PySide6 (Qt) one piece at a time; that
 migration is done. **`qt_app/` is the app -- `main.py` runs it** and it
 covers every screen the old one did (Setup, the interactive preview
-canvas, Start Tracking + Results for all three analysis types, dark mode,
-Maze Template, Manual Scoring, and the Deep Learning Classifier panel).
+canvas, Start Tracking + Results for all three analysis types, the Quick
+Setup apparatus templates, Manual Scoring, and the Deep Learning
+Classifier panel).
 `gui/` (Tkinter) is kept working as an unmaintained fallback/reference,
 run via `main_legacy_tkinter.py` -- not the recommended way to run the
 app, and not what the PyInstaller build (`BehavioralTracker.spec`)
@@ -103,15 +104,16 @@ unchanged, for comparison or as a fallback.
 ## Remaining roadmap
 
 1. ~~Rebuild the GUI in PySide6~~ -- done: Setup, interactive canvas, Start
-   Tracking + Results (all 3 analysis types), Maze Template, Manual
-   Scoring, Deep Learning Classifier panel are all wired up in `qt_app/`.
+   Tracking + Results (all 3 analysis types), Quick Setup apparatus
+   templates, Manual Scoring, Deep Learning Classifier panel are all
+   wired up in `qt_app/`.
 2. A dedicated Settings screen (Detection Settings currently live on the
    Setup page itself, same as before).
 3. ~~Full headless regression pass consolidated into a permanent test
-   suite~~ -- done: `qt_app/tests/` (6 suites -- core UI, Maze Template,
-   Start Tracking/Results for all 3 analysis types, Manual Scoring, the
-   batch/subject/Excel-export features below, and the Deep Learning
-   Classifier pipeline end to end). Run with
+   suite~~ -- done: `qt_app/tests/` (6 suites -- core UI, Quick Setup
+   apparatus templates, Start Tracking/Results for all 3 analysis types,
+   Manual Scoring, the batch/subject/Excel-export features below, and the
+   Deep Learning Classifier pipeline end to end). Run with
    `xvfb-run -a python3.12 qt_app/tests/run_all.py`; see
    `qt_app/tests/README.md`.
 4. ~~Batch mode per-video zone alignment, Subject database, Excel

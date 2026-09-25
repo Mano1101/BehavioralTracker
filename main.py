@@ -3,9 +3,8 @@
 This is the current, actively maintained app. The old Tkinter GUI
 (`gui/main_window.py`) still exists as an unmaintained fallback at
 `main_legacy_tkinter.py` -- run `python main_legacy_tkinter.py` only if
-you specifically need it; everything new (dark mode, batch mode, subject
-database, shape tools, Excel export, behavior classification, etc.) is
-built here.
+you specifically need it; everything new (batch mode, subject database,
+shape tools, Excel export, behavior classification, etc.) is built here.
 
 Renamed from `main_qt.py` on 2026-09-24, once this GUI became the primary
 app rather than a parallel/experimental one -- the previous name led to a
@@ -32,9 +31,8 @@ def main():
     app.setOrganizationName("BehavioralTracker")
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
-    # MainWindow.__init__ re-applies the stylesheet itself once it has
-    # restored the saved light/dark preference (theme.set_dark), so this
-    # first pass just avoids an unstyled flash before that happens.
+    # MainWindow.__init__ also applies this same stylesheet; doing it here
+    # too just avoids an unstyled flash before the window is constructed.
     app.setStyleSheet(build_stylesheet(PALETTE))
     window = MainWindow()
     window.show()
