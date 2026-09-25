@@ -7,12 +7,12 @@ scipy>=1.10
 tqdm>=4.65
 PySide6>=6.5
 
-# tkinter is only needed for the OLD fallback GUI (`python main_legacy_tkinter.py`).
-# It's part of the Python standard library, not a pip package, and ships with the
+# tkinter is only needed for the OLD GUI (`python main.py`). It's part of
+# the Python standard library, not a pip package, and ships with the
 # standard Windows/macOS Python installers. On Linux, if "import tkinter"
 # fails, install it via your system package manager, e.g.:
 #   sudo apt-get install python3-tk
-# The current GUI (`python main.py`, PySide6-based) doesn't need it.
+# The current GUI (`python main_qt.py`, PySide6-based) doesn't need it.
 
 # OPTIONAL -- only needed for the "Deep Learning Classifier" panel on the
 # Behavior Classification screen (Prepare Training Data works without it;
