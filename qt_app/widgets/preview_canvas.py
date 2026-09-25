@@ -38,6 +38,34 @@ DISTANCE_COLOR = (255, 0, 255)       # magenta
 GRID_COLOR = (222, 222, 222)         # faint light gray, snap-to-grid aid
 
 
+def _overlay_sizes(frame):
+    """Line/point/font sizes for zone/mask/object/distance overlays,
+    scaled to the FRAME's own pixel size rather than fixed absolute
+    pixels. Overlays are drawn in frame-pixel space before PreviewCanvas
+    scales the whole image to fit the widget (see draw_overlays'
+    docstring) -- a fixed-size line looks right on a full-resolution
+    frame, but on a small CROPPED/warped frame (e.g. zoomed in tight
+    around just the maze, which is the common case -- the arena is
+    usually a small part of the raw camera frame) that same line gets
+    stretched right along with the image once Qt scales it up to fill the
+    preview canvas, turning a thin line and small label into a thick,
+    overlapping one. Scaling to the frame's own shorter side keeps
+    overlays looking like the same weight of line/text regardless of how
+    tightly the video was cropped. The baseline itself is also smaller
+    than it used to be (MM: "the marking lines are very big, make
+    smaller")."""
+    h, w = frame.shape[:2]
+    short_side = min(w, h) if min(w, h) > 0 else 800
+    s = max(0.35, min(1.5, short_side / 800.0))
+    return {
+        "line": max(1, round(1 * s)),
+        "line_active": max(1, round(2 * s)),
+        "point_r": max(2, round(3 * s)),
+        "font_scale": round(0.38 * s, 3),
+        "font_thick": max(1, round(1 * s)),
+    }
+
+
 def _pt(p):
     return int(round(p[0])), int(round(p[1]))
 
@@ -57,11 +85,14 @@ def _draw_dashed_line(frame, p1, p2, color, thickness=2, dash_len=8, gap_len=5):
         pos += dash_len + gap_len
 
 
-def _draw_polygon_set(frame, shapes, color, dashed=False, point_radius=4, active_index=None):
+def _draw_polygon_set(frame, shapes, color, dashed=False, point_radius=None, active_index=None):
     """Unnamed shapes (crop corners, mask regions). Mirrors
     TrackerApp._draw_polygon_set."""
+    sizes = _overlay_sizes(frame)
+    if point_radius is None:
+        point_radius = sizes["point_r"]
     for i, pts in enumerate(shapes):
-        width = 3 if i == active_index else 2
+        width = sizes["line_active"] if i == active_index else sizes["line"]
         if len(pts) >= 2:
             for j in range(len(pts) - 1):
                 if dashed:
@@ -95,11 +126,14 @@ def _draw_grid(frame, spacing):
         y += spacing
 
 
-def _draw_named_polygon_set(frame, regions, color, active_region=None, point_radius=4):
+def _draw_named_polygon_set(frame, regions, color, active_region=None, point_radius=None):
     """Named shapes (zones, objects, template zones). Mirrors
     TrackerApp._draw_named_polygon_set."""
+    sizes = _overlay_sizes(frame)
+    if point_radius is None:
+        point_radius = sizes["point_r"]
     for name, pts in regions.items():
-        width = 3 if name == active_region else 2
+        width = sizes["line_active"] if name == active_region else sizes["line"]
         if len(pts) >= 2:
             for j in range(len(pts) - 1):
                 cv2.line(frame, _pt(pts[j]), _pt(pts[j + 1]), color, width, cv2.LINE_AA)
@@ -112,7 +146,7 @@ def _draw_named_polygon_set(frame, regions, color, active_region=None, point_rad
             mx = sum(p[0] for p in pts) / len(pts)
             my = sum(p[1] for p in pts) / len(pts)
             cv2.putText(frame, name, (int(mx) - 10, int(my)), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, color, 2, cv2.LINE_AA)
+                        sizes["font_scale"], color, sizes["font_thick"], cv2.LINE_AA)
 
 
 def draw_overlays(frame_bgr, app):
@@ -120,6 +154,7 @@ def draw_overlays(frame_bgr, app):
     (non-editing) pending_* overlays, matching what the real analysis run
     will draw. Used whenever no interactive op is in progress."""
     disp = frame_bgr.copy()
+    sizes = _overlay_sizes(disp)
 
     if app.pending_mask_points:
         _draw_polygon_set(disp, app.pending_mask_points, MASK_COLOR, dashed=True)
@@ -130,10 +165,11 @@ def draw_overlays(frame_bgr, app):
                 continue
             color = ROI_COLORS[i % len(ROI_COLORS)]
             arr = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(disp, [arr], True, color, 2, lineType=cv2.LINE_AA)
+            cv2.polylines(disp, [arr], True, color, sizes["line"], lineType=cv2.LINE_AA)
             cx = int(np.mean([p[0] for p in pts]))
             cy = int(np.mean([p[1] for p in pts]))
-            cv2.putText(disp, name, (cx - 10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+            cv2.putText(disp, name, (cx - 10, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                        sizes["font_scale"], color, sizes["font_thick"], cv2.LINE_AA)
 
     if app.pending_object_points:
         for i, (name, pts) in enumerate(sorted(app.pending_object_points.items())):
@@ -141,8 +177,9 @@ def draw_overlays(frame_bgr, app):
                 continue
             color = OBJECT_COLORS[i % len(OBJECT_COLORS)]
             x, y = pts[0]
-            cv2.circle(disp, (int(x), int(y)), 6, color, -1, lineType=cv2.LINE_AA)
-            cv2.putText(disp, name, (int(x) + 10, int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+            cv2.circle(disp, (int(x), int(y)), sizes["point_r"], color, -1, lineType=cv2.LINE_AA)
+            cv2.putText(disp, name, (int(x) + 10, int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+                        sizes["font_scale"], color, sizes["font_thick"], cv2.LINE_AA)
 
     return disp
 
@@ -154,6 +191,7 @@ def draw_op_overlay(frame_bgr, op):
     directly (already copied)."""
     disp = frame_bgr
     kind = op["kind"]
+    sizes = _overlay_sizes(disp)
 
     if op.get("snap") and op.get("grid_spacing"):
         _draw_grid(disp, op["grid_spacing"])
@@ -170,14 +208,15 @@ def draw_op_overlay(frame_bgr, op):
         _draw_named_polygon_set(disp, op["regions"], TEMPLATE_ZONE_COLOR)
     elif kind == "distance":
         for p in op["points"]:
-            cv2.circle(disp, _pt(p), 4, DISTANCE_COLOR, -1, cv2.LINE_AA)
+            cv2.circle(disp, _pt(p), sizes["point_r"], DISTANCE_COLOR, -1, cv2.LINE_AA)
         if len(op["points"]) == 2:
             p0, p1 = op["points"]
-            cv2.line(disp, _pt(p0), _pt(p1), DISTANCE_COLOR, 2, cv2.LINE_AA)
+            cv2.line(disp, _pt(p0), _pt(p1), DISTANCE_COLOR, sizes["line"], cv2.LINE_AA)
             px_d = point_distance(p0, p1)
             mx, my = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
             cv2.putText(disp, f"{px_d:.1f} px", (int(mx) - 25, int(my) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, DISTANCE_COLOR, 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, sizes["font_scale"], DISTANCE_COLOR,
+                        sizes["font_thick"], cv2.LINE_AA)
 
     return disp
 
@@ -225,7 +264,20 @@ class PreviewCanvas(QWidget):
             return
 
         annotated = draw_op_overlay(frame.copy(), op) if op is not None else draw_overlays(frame, app)
-        frame_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+        self.display_frame(annotated)
+
+    def display_frame(self, frame_bgr):
+        """Scale an already-annotated BGR frame to fit the canvas and show
+        it, the same aspect-preserving fit refresh() uses, but bypassing
+        app._op/get_warped_active_frame() entirely -- for a frame that came
+        from somewhere else: the on-demand background/reference preview
+        (MainWindow.on_preview_background) or a live frame pushed in while
+        Start Tracking is running (MainWindow.on_live_tracking_frame). The
+        next refresh_canvas()/resizeEvent() (e.g. from clicking a normal
+        drawing tool, or just resizing the window) goes back to the regular
+        calibration view -- this is meant as a transient snapshot, not a
+        replacement for it."""
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         frame_rgb = np.ascontiguousarray(frame_rgb)
         h, w, _ = frame_rgb.shape
         qimg = QImage(frame_rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
