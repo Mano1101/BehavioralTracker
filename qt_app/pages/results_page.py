@@ -22,9 +22,10 @@ from PySide6.QtWidgets import (
 from qt_app.theme import PALETTE
 from qt_app.widgets.results_charts import TrajectoryWidget, EthogramWidget, MOUSE_COLORS, BEHAVIOR_COLORS
 
-# See the identical note in setup_page.py: PALETTE is mutated in place on
-# a theme switch, so read PALETTE['MUTED'] fresh at each call site below
-# rather than caching it in a module-level constant.
+# See the identical note in setup_page.py: PALETTE is one fixed dict (no
+# runtime theme switch anymore), but call sites below still read
+# PALETTE['MUTED'] etc. fresh rather than caching it in a module-level
+# constant, for consistency.
 
 
 def _hint(text):
@@ -264,19 +265,32 @@ class ResultsPage(QWidget):
             panel.addWidget(title)
             pic = QLabel()
             pic.setAlignment(Qt.AlignCenter)
-            pic.setStyleSheet("background: #dddddd; border-radius: 4px;")
+            pic.setStyleSheet(f"background: {PALETTE['SURFACE']}; border: 1px solid {PALETTE['BORDER']}; "
+                               "border-radius: 6px;")
             pic.setFixedHeight(panel_h)
             pic.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             pix = QPixmap(os.path.join(self.output_dir, fname))
             if not pix.isNull():
-                pic.setPixmap(pix.scaled(pic.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                # Scale to the one dimension we actually know at this point
+                # (panel_h, just fixed above) rather than pic.size() -- the
+                # label hasn't been through a layout pass yet here, so its
+                # width is still whatever a fresh QLabel defaults to, not
+                # the real panel width the Expanding size policy will later
+                # give it. Scaling against that unknown produced a
+                # wrong-sized (often tiny) frozen pixmap that never
+                # corrected itself, since a QLabel doesn't auto-rescale a
+                # pixmap you set on it. Scaling to the fixed height and
+                # centering (AlignCenter above) sidesteps the problem
+                # entirely instead of needing a resize-aware subclass.
+                pic.setPixmap(pix.scaledToHeight(panel_h, Qt.SmoothTransformation))
             panel.addWidget(pic)
             views_row.addLayout(panel)
         center.addLayout(views_row)
         if not available_views:
             empty_lbl = QLabel("No result images were generated for this run.")
             empty_lbl.setAlignment(Qt.AlignCenter)
-            empty_lbl.setStyleSheet("background: #dddddd; border-radius: 4px; padding: 20px;")
+            empty_lbl.setStyleSheet(f"background: {PALETTE['SURFACE']}; color: {PALETTE['MUTED']}; "
+                                      f"border: 1px solid {PALETTE['BORDER']}; border-radius: 6px; padding: 20px;")
             center.addWidget(empty_lbl)
 
         preview_dir = os.path.join(self.output_dir, "preview")

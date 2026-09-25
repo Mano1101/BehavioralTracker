@@ -19,14 +19,11 @@ from qt_app.theme import PALETTE
 from qt_app.widgets.preview_canvas import PreviewCanvas
 from tracking.maze_templates import TEMPLATES as MAZE_TEMPLATES
 
-# NOTE on theme reactivity: PALETTE is a single dict object that
-# theme.set_dark()/set_light() mutate IN PLACE (clear+update), so every
-# `PALETTE['MUTED']` lookup below always reflects the CURRENT theme as
-# long as it's a fresh dict read at call time. Do NOT pre-extract a color
-# into a module-level constant (e.g. `MUTED = PALETTE["MUTED"]`) -- that
-# snapshots today's string once at import time and then never changes,
-# which is exactly what used to make dark mode's hint-text stay
-# light-mode-gray forever. Read PALETTE['MUTED'] fresh every time instead.
+# NOTE: PALETTE is one fixed dict now (dark mode was removed entirely --
+# see theme.py's docstring), so this no longer needs to stay reactive to a
+# runtime theme swap. Still read PALETTE['MUTED'] etc. fresh at each call
+# site below rather than pre-extracting into a module-level constant, just
+# for consistency with the rest of the codebase.
 
 
 def _hint(text, wrap=True):
@@ -60,7 +57,6 @@ class SetupPage(QWidget):
         "loco_thresh_entry", "rear_thresh_entry", "groom_thresh_entry",
         "immobile_thresh_entry", "min_bout_entry",
     ]
-    COMBO_ATTRS = ["output_size_entry"]
     CHECK_ATTRS = [
         "use_window_var", "use_zone_threshold_var", "reject_shadows_var",
         "loc_var", "interact_var", "entries_var", "altern_var", "all_var",
@@ -111,14 +107,6 @@ class SetupPage(QWidget):
                 continue
             try:
                 app._memory[name] = w.text()
-            except RuntimeError:
-                pass
-        for name in self.COMBO_ATTRS:
-            w = getattr(self, name, None)
-            if w is None:
-                continue
-            try:
-                app._memory[name] = w.currentText()
             except RuntimeError:
                 pass
         for name in self.CHECK_ATTRS:
@@ -201,9 +189,19 @@ class SetupPage(QWidget):
         if self.canvas is not None:
             self.canvas.refresh()
 
+    def reset_canvas_title(self):
+        """Restores the header above the canvas back to its normal text --
+        call after showing a background/reference preview or a live
+        tracking frame there (see on_preview_background/
+        on_live_tracking_frame in main_window.py), which retitle it
+        temporarily."""
+        if getattr(self, "canvas_title_label", None) is not None:
+            self.canvas_title_label.setText("Preview / Calibration")
+
     def reset_canvas_tool_state(self):
         self.hide_op_bar()
         self._restyle_tool_buttons(None)
+        self.reset_canvas_title()
         self.refresh_canvas()
 
     def _restyle_tool_buttons(self, active_key):
@@ -580,11 +578,6 @@ class SetupPage(QWidget):
                     w.setText("")
                 except RuntimeError:
                     pass
-        if hasattr(self, "output_size_entry"):
-            try:
-                self.output_size_entry.setCurrentText("Same as input")
-            except RuntimeError:
-                pass
         for name in ("interact_var", "entries_var", "altern_var", "all_var"):
             w = getattr(self, name, None)
             if w is not None:
@@ -759,6 +752,9 @@ class SetupPage(QWidget):
         tv.addWidget(QLabel("ROI names (comma-separated):"))
         self.roi_names_entry = QLineEdit(self.app._memory.get("roi_names_entry", ""))
         tv.addWidget(self.roi_names_entry)
+        tv.addWidget(_hint("Optional -- leave this blank and click 'Draw Zones' below instead: "
+                            "draw each zone's line/box/oval on the video and you'll be asked to "
+                            "name it right after, one at a time."))
         tv.addWidget(_hint("Object names (only used if Interaction Tracking is on):"))
         self.object_names_entry = QLineEdit(self.entry_or_default("object_names_entry", ""))
         tv.addWidget(self.object_names_entry)
@@ -769,15 +765,6 @@ class SetupPage(QWidget):
         self.interaction_margin_entry.setFixedWidth(60)
         tv.addWidget(self.interaction_margin_entry)
         left.addWidget(time_box)
-
-        out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("Video output size:"))
-        self.output_size_entry = QComboBox()
-        self.output_size_entry.addItems(["Same as input", "1920x1080", "1280x720", "854x480", "640x480"])
-        self.output_size_entry.setCurrentText(self.entry_or_default("output_size_entry", "Same as input"))
-        out_row.addWidget(self.output_size_entry)
-        out_row.addStretch()
-        left.addLayout(out_row)
 
         analysis_box = QGroupBox("Analysis")
         av = QVBoxLayout(analysis_box)
@@ -814,12 +801,24 @@ class SetupPage(QWidget):
         av.addWidget(self.all_var)
         left.addWidget(analysis_box)
 
-        # ---- Quick Setup: one click from an arena template straight to
-        # zone drawing, reusing the same real templates as Maze Template.
-        quick_box = QGroupBox("Quick Setup (Arena Templates)")
+        # ---- Quick Setup: pick a known apparatus, then draw each of its
+        # zones by hand (Line/Rectangle/Ellipse/Freehand), with that
+        # apparatus's own zone names offered as suggestions right after
+        # each shape, in order (Center, Open Arm 1, ...) -- see
+        # MainWindow.quick_setup_template/_next_auto_zone_name. This is now
+        # the ONLY apparatus-template entry point: the old separate "Maze
+        # Template" dialog used to auto-generate a default-sized shape for
+        # each zone and have you drag its corners into alignment, but MM
+        # asked for that replaced everywhere with the same
+        # draw-it-yourself-then-name-it interaction "Draw Zones" already
+        # uses, since tracing the real photographed maze by hand lines up
+        # better than dragging an idealized default shape into place ever
+        # did -- so there's no separate dialog anymore, just these tiles.
+        quick_box = QGroupBox("Quick Setup (Apparatus Templates)")
         qv = QVBoxLayout(quick_box)
-        qv.addWidget(_hint("Crop or set the arena above first, then pick a shape here to draw "
-                            "its zones instantly with default sizes."))
+        qv.addWidget(_hint("Crop or set the arena above first, then pick your apparatus here -- "
+                            "you'll draw each zone yourself (Draw Zones' shape tools) and it'll "
+                            "suggest that apparatus's zone names as you go, one at a time."))
         grid = QGridLayout()
         tiles = [(k, MAZE_TEMPLATES[k]["label"]) for k in MAZE_TEMPLATES.keys()]
         tiles.append((None, "Custom Arena"))
@@ -843,7 +842,11 @@ class SetupPage(QWidget):
         # ---- CENTER: preview canvas + toolbar ----
         center = QVBoxLayout()
         center_hdr = QHBoxLayout()
-        center_hdr.addWidget(QLabel("Preview / Calibration"))
+        # Stashed on self so on_preview_background()/on_live_tracking_frame()
+        # can retitle this while showing something other than the normal
+        # live calibration view, then hand it back with reset_canvas_title().
+        self.canvas_title_label = QLabel("Preview / Calibration")
+        center_hdr.addWidget(self.canvas_title_label)
         center_hdr.addStretch()
         reset_calib_btn = QPushButton("Reset")
         reset_calib_btn.setObjectName("resetSmallBtn")
@@ -857,7 +860,6 @@ class SetupPage(QWidget):
             ("crop", "Crop Arena", lambda: self.app.start_op("crop")),
             ("mask", "Mask Zone", lambda: self.app.start_op("mask")),
             ("zones", "Draw Zones", lambda: self.app.start_op("zones")),
-            ("maze", "Maze Template", self.app.on_open_maze_template_dialog),
             ("objects", "Mark Objects", lambda: self.app.start_op("objects")),
             ("distance", "Calibrate Distance", lambda: self.app.start_op("distance")),
             ("nocrop", "No Crop", self.app.on_tool_no_crop),
@@ -868,6 +870,15 @@ class SetupPage(QWidget):
             b.clicked.connect(cmd)
             toolbar.addWidget(b)
             self.tool_buttons[key] = b
+        preview_bg_btn = QPushButton("Preview Background")
+        preview_bg_btn.setObjectName("toolBtn")
+        preview_bg_btn.setToolTip(
+            "Shows the current video frame (reference) next to the computed empty/background "
+            "frame, with your zones drawn on both -- check this before Start Tracking to catch "
+            "a bad background (e.g. the animal baked into it) early."
+        )
+        preview_bg_btn.clicked.connect(self.app.on_preview_background)
+        toolbar.addWidget(preview_bg_btn)
         toolbar.addStretch()
         center.addLayout(toolbar)
 
@@ -950,15 +961,6 @@ class SetupPage(QWidget):
         self.entries_var = QCheckBox(); self.entries_var.setChecked(False)
         self.altern_var = QCheckBox(); self.altern_var.setChecked(False)
         self.all_var = QCheckBox(); self.all_var.setChecked(False)
-
-        out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("Video output size:"))
-        self.output_size_entry = QComboBox()
-        self.output_size_entry.addItems(["Same as input", "1920x1080", "1280x720", "854x480", "640x480"])
-        self.output_size_entry.setCurrentText(self.entry_or_default("output_size_entry", "Same as input"))
-        out_row.addWidget(self.output_size_entry)
-        out_row.addStretch()
-        left.addLayout(out_row)
 
         beh_box = QGroupBox("Behaviors to detect")
         bv = QVBoxLayout(beh_box)
