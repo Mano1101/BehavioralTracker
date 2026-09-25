@@ -1,0 +1,22 @@
+opencv-python>=4.8
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+openpyxl>=3.1
+scipy>=1.10
+tqdm>=4.65
+PySide6>=6.5
+
+# tkinter is only needed for the OLD fallback GUI (`python main_legacy_tkinter.py`).
+# It's part of the Python standard library, not a pip package, and ships with the
+# standard Windows/macOS Python installers. On Linux, if "import tkinter"
+# fails, install it via your system package manager, e.g.:
+#   sudo apt-get install python3-tk
+# The current GUI (`python main.py`, PySide6-based) doesn't need it.
+
+# OPTIONAL -- only needed for the "Deep Learning Classifier" panel on the
+# Behavior Classification screen (Prepare Training Data works without it;
+# Train Model / Use trained model need it). Everything else in the app
+# works fully without installing this. See https://pytorch.org for the
+# right install command for your machine (CPU-only vs. a GPU/CUDA build).
+# torch>=2.2
