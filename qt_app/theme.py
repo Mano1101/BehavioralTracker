@@ -6,20 +6,14 @@ gradient/brand language from the confirmed Design mockups, so the two GUIs
 look like the same product while this migration is in progress and the
 Tkinter version is still the fallback.
 
-DARK MODE: PALETTE is a single dict object that both the global QSS
-(build_stylesheet) and a handful of widgets read individual colors from
-directly (e.g. `f"color: {PALETTE['MUTED']}"`, always as a fresh dict
-lookup, never pre-extracted into a standalone module-level constant --
-see the note in setup_page.py/results_page.py). set_dark()/set_light()
-MUTATE this same dict object in place (clear+update, not reassignment) so
-every module that did `from qt_app.theme import PALETTE` keeps working
-off the live, current theme without needing its own re-import. Applying
-the new colors to already-built widgets is still the caller's job --
-MainWindow.on_toggle_theme() re-applies the global stylesheet and rebuilds
-the Setup page so its inline-styled hint labels pick up the fresh values.
+One fixed palette now -- a dark-mode toggle used to live here (a second
+DARK_PALETTE dict plus set_dark()/set_light() to swap PALETTE's contents in
+place), but MM asked for it to be removed entirely rather than just hidden,
+so it's gone: PALETTE is just this one dict, plain and simple, and nothing
+mutates it at runtime.
 """
 
-LIGHT_PALETTE = {
+PALETTE = {
     "BG": "#f5f6f8",
     "SURFACE": "#ffffff",
     "HEADER_BG": "#152238",
@@ -39,48 +33,8 @@ LIGHT_PALETTE = {
     "PROGRESS_TRACK": "#e2e2e2",
     "ACCENT_DISABLED": "#a7c3dd",
     "APP_BRAND": "BehavioralTracker",
-    "APP_VERSION": "v1.8",
-    "IS_DARK": False,
+    "APP_VERSION": "v1.10",
 }
-
-DARK_PALETTE = {
-    "BG": "#1a1d24",
-    "SURFACE": "#242832",
-    "HEADER_BG": "#11141b",
-    "HEADER_BG_2": "#1a2c47",
-    "ACCENT": "#5b9bd9",
-    "ACCENT_DARK": "#4682b4",
-    "ACCENT_LIGHT": "#2a3b52",
-    "SUCCESS": "#4fbf87",
-    "SUCCESS_DARK": "#3d9e6c",
-    "DANGER": "#e05b4d",
-    "DANGER_DARK": "#c2483c",
-    "TEXT": "#e7e9ec",
-    "TEXT_SOFT": "#b7bcc6",
-    "MUTED": "#9aa1ac",
-    "BORDER": "#3a3f4a",
-    "CARD_BG": "#2c313d",
-    "PROGRESS_TRACK": "#333844",
-    "ACCENT_DISABLED": "#3a5170",
-    "APP_BRAND": "BehavioralTracker",
-    "APP_VERSION": "v1.8",
-    "IS_DARK": True,
-}
-
-# The dict object every `from qt_app.theme import PALETTE` gets a reference
-# to. Its VALUES are swapped in place by set_dark()/set_light() -- the dict
-# itself is never reassigned, so existing imports stay live.
-PALETTE = dict(LIGHT_PALETTE)
-
-
-def set_dark(enabled):
-    """Mutate PALETTE in place to the dark or light theme's colors."""
-    PALETTE.clear()
-    PALETTE.update(DARK_PALETTE if enabled else LIGHT_PALETTE)
-
-
-def is_dark():
-    return bool(PALETTE.get("IS_DARK"))
 
 
 def build_stylesheet(p=PALETTE):
@@ -182,12 +136,6 @@ def build_stylesheet(p=PALETTE):
 
     QWidget#previewCanvas {{ background: #141a22; border-radius: 6px; }}
 
-    QPushButton#themeToggleBtn {{
-        background: {p['HEADER_BG_2']}; color: white; font-size: 11px; font-weight: 600;
-        border: 1px solid #33507a; border-radius: 6px; padding: 6px 12px;
-    }}
-    QPushButton#themeToggleBtn:hover {{ background: {p['ACCENT_DARK']}; }}
-
     QWidget, QLabel, QLineEdit, QComboBox, QCheckBox, QRadioButton {{
         color: {p['TEXT']};
     }}
@@ -195,21 +143,64 @@ def build_stylesheet(p=PALETTE):
         background: {p['SURFACE']}; border: 1px solid {p['BORDER']}; border-radius: 5px;
         padding: 3px 6px;
     }}
+    QLineEdit:focus, QComboBox:focus {{ border: 1px solid {p['ACCENT']}; }}
+    QLineEdit:disabled, QComboBox:disabled {{ background: {p['CARD_BG']}; color: {p['MUTED']}; }}
+    QComboBox::drop-down {{ border: none; width: 18px; }}
+    QComboBox QAbstractItemView {{
+        background: {p['SURFACE']}; border: 1px solid {p['BORDER']}; selection-background-color: {p['ACCENT_LIGHT']};
+        selection-color: {p['TEXT']}; outline: none;
+    }}
+
+    QCheckBox, QRadioButton {{ spacing: 7px; }}
+    QCheckBox::indicator, QRadioButton::indicator {{
+        width: 15px; height: 15px; border: 1px solid {p['BORDER']}; background: {p['SURFACE']};
+    }}
+    QCheckBox::indicator {{ border-radius: 4px; }}
+    QRadioButton::indicator {{ border-radius: 8px; }}
+    QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border: 1px solid {p['ACCENT']}; }}
+    QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+        background: {p['ACCENT']}; border: 1px solid {p['ACCENT']};
+    }}
+    QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{ background: {p['CARD_BG']}; }}
+
+    /* Flat, modern scrollbars -- the left/right setup panels and the
+    results page scroll internally (see _scroll_column in setup_page.py/
+    results_page.py), so these show up often enough to be worth styling
+    rather than leaving the chunky OS-default look MM's "beautiful" ask
+    was about. */
+    QScrollBar:vertical {{
+        background: transparent; width: 10px; margin: 2px;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {p['BORDER']}; border-radius: 5px; min-height: 24px;
+    }}
+    QScrollBar::handle:vertical:hover {{ background: {p['ACCENT']}; }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; border: none; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+    QScrollBar:horizontal {{
+        background: transparent; height: 10px; margin: 2px;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: {p['BORDER']}; border-radius: 5px; min-width: 24px;
+    }}
+    QScrollBar::handle:horizontal:hover {{ background: {p['ACCENT']}; }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; border: none; }}
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: none; }}
+
+    QToolTip {{
+        background: {p['HEADER_BG']}; color: white; border: 1px solid {p['ACCENT']};
+        border-radius: 4px; padding: 4px 7px; font-size: 10px;
+    }}
+
     QScrollArea, QAbstractScrollArea {{ background: {p['BG']}; }}
 
     /* Plain, unnamed QWidget containers used purely as layout holders
     (a QScrollArea's inner content widget, a page's body/bottom strip)
     never get a background from the rules above -- QScrollArea's own
     "background" only paints its frame, not its internal viewport, and
-    an ordinary QWidget falls back to Qt's default (light) palette
-    regardless of theme. That's invisible in light mode (the default
-    palette is already close to LIGHT_PALETTE's BG) but in dark mode it
-    left pale, barely-readable strips (e.g. behind the "Video" label and
-    a QGroupBox's title, which is painted in its parent's margin, not
-    the box's own SURFACE-colored body) wherever one of these bare
-    containers peeked through. Every such container is explicitly
-    object-named (setup_page.py/results_page.py) so it can be targeted
-    here directly, the same way every other themed widget in this
-    stylesheet is. */
+    an ordinary QWidget falls back to Qt's default palette otherwise.
+    Every such container is explicitly object-named (setup_page.py/
+    results_page.py) so it can be targeted here directly, the same way
+    every other themed widget in this stylesheet is. */
     QWidget#pageBody, QWidget#scrollContent {{ background: {p['BG']}; }}
     """

@@ -29,35 +29,15 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 
-from qt_app import theme
 from qt_app.theme import PALETTE, build_stylesheet
 
-APP_SETTINGS_PATH = os.path.expanduser("~/.behavioraltracker_settings.json")
 ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "resources", "icon.png")
 
-
-def load_app_settings():
-    """Small persisted app-level prefs (currently just dark mode) -- separate
-    from a project's .btproj file and from the in-memory self._memory dict,
-    since this should survive across different videos/projects and even a
-    fresh app restart, not just a Reset All."""
-    try:
-        with open(APP_SETTINGS_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_app_settings(data):
-    try:
-        with open(APP_SETTINGS_PATH, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
 from tracking.location import (
     identity_transform, compute_perspective_transform, process_single_video,
     compute_output_dir, compute_zone_interaction_stats,
+    make_background, read_and_warp,
 )
 from tracking.two_mouse import (
     track_video, save_preview_frames as save_preview_frames_multi_mouse, choose_color_mode,
@@ -67,21 +47,13 @@ from tracking.behavior import (
 )
 from tracking.maze_templates import TEMPLATES as MAZE_TEMPLATES
 from analysis.calculations import point_distance
+from qt_app.widgets.preview_canvas import draw_overlays
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # Dark mode: a small persisted app-level prefs file (see
-        # load_app_settings), not the project .btproj or the in-memory
-        # _memory dict -- restored before any widget is built so the very
-        # first paint already uses the right theme, matching theme.PALETTE
-        # (mutated in place by theme.set_dark) rather than rebuilding a
-        # separate palette object here.
-        self._app_settings = load_app_settings()
-        self.dark_mode = bool(self._app_settings.get("dark_mode", False))
-        theme.set_dark(self.dark_mode)
         app_instance = QApplication.instance()
         if app_instance is not None:
             app_instance.setStyleSheet(build_stylesheet(PALETTE))
@@ -228,14 +200,10 @@ class MainWindow(QMainWindow):
         help_btn = QPushButton("Help")
         help_btn.setObjectName("headerBtn")
         help_btn.clicked.connect(self.on_open_help)
-        self.theme_toggle_btn = QPushButton("☀ Light" if self.dark_mode else "🌙 Dark")
-        self.theme_toggle_btn.setObjectName("themeToggleBtn")
-        self.theme_toggle_btn.setToolTip("Switch between light and dark mode")
-        self.theme_toggle_btn.clicked.connect(self.on_toggle_theme)
         reset_btn = QPushButton("Reset All")
         reset_btn.setObjectName("resetAllBtn")
         reset_btn.clicked.connect(self.on_reset_all)
-        for b in (open_btn, save_btn, settings_btn, self.theme_toggle_btn, help_btn, reset_btn):
+        for b in (open_btn, save_btn, settings_btn, help_btn, reset_btn):
             actions.addWidget(b)
         layout.addLayout(actions)
 
@@ -329,39 +297,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(version_lbl)
         self._footer_copyright = copyright_lbl
         return footer
-
-    def on_toggle_theme(self):
-        """Flip light/dark. The bulk of the chrome (header, buttons, cards,
-        the Setup/Results pages' QGroupBoxes, etc.) is styled purely through
-        object-name QSS selectors in theme.build_stylesheet, so re-applying
-        the app-wide stylesheet after theme.set_dark() repaints all of that
-        automatically. A handful of labels set an explicit color inline at
-        construction time (status_label, the step-arrow labels, the top
-        separator) and need re-styling by hand here; the Setup page's own
-        inline-styled hint labels are refreshed by rebuilding it."""
-        self.dark_mode = not self.dark_mode
-        theme.set_dark(self.dark_mode)
-        app_instance = QApplication.instance()
-        if app_instance is not None:
-            app_instance.setStyleSheet(build_stylesheet(PALETTE))
-        self.theme_toggle_btn.setText("☀ Light" if self.dark_mode else "🌙 Dark")
-        self._top_sep.setStyleSheet(f"color: {PALETTE['BORDER']};")
-        self.status_label.setStyleSheet(f"color: {PALETTE['MUTED']}; font-size: 11px;")
-        for arrow in getattr(self, "_step_arrows", []):
-            arrow.setStyleSheet(f"color: {PALETTE['MUTED']};")
-        try:
-            # resave=True (the default) so whatever the researcher has
-            # already typed into the current fields (ROI names, thresholds,
-            # etc.) is preserved into _memory before the page is torn down
-            # and rebuilt with the new theme's colors -- resave=False is
-            # only for right after Open Project/Reset All, where _memory
-            # was JUST written fresh and resaving would overwrite it with
-            # stale on-screen values (see rebuild()'s own docstring).
-            self.setup_page.rebuild()
-        except Exception:
-            pass
-        self._app_settings["dark_mode"] = self.dark_mode
-        save_app_settings(self._app_settings)
 
     # ------------------------------------------------------------------
     # Step tracker + analysis-type switching
@@ -501,9 +436,9 @@ class MainWindow(QMainWindow):
         if not self.pending_roi_points:
             QMessageBox.critical(
                 self, "Set up zones first",
-                "Define zones once (Draw Zones or a Maze Template) on the active video before "
-                "aligning individual videos in the queue -- each video then starts from that "
-                "same shape and you just nudge its corners to fit."
+                "Define zones once (Draw Zones, or a Quick Setup apparatus tile) on the active "
+                "video before aligning individual videos in the queue -- each video then starts "
+                "from that same shape and you just nudge its corners to fit."
             )
             return
         self.active_index = index
@@ -640,25 +575,27 @@ class MainWindow(QMainWindow):
         self.setup_page.refresh_canvas()
 
     def quick_setup_template(self, key):
-        """One click from an arena template straight to its zones, using
-        the template's own default sizes. Needs the arena already set
-        (Crop Arena or No Crop). Generates the zones then hands off to the
-        SAME interactive template_zones op the Maze Template dialog uses
-        (start_template_zone_op), so the researcher can drag a generated
-        zone's corners to fit the real maze on the canvas, and use the
-        per-zone button in the op bar to rename one (e.g. swap which arm
-        is Open/Closed) before Finish commits it -- rather than silently
-        committing whatever the template guessed."""
+        """A 'Quick Setup' apparatus tile (Elevated Plus Maze, Y-Maze, ...).
+        Needs the arena already set (Crop Arena or No Crop).
+
+        Used to auto-generate a default-sized shape for every one of the
+        template's zones and hand off to a drag-the-corners-to-align op
+        (start_template_zone_op) -- MM asked for that replaced everywhere
+        with the SAME draw-it-yourself-then-name-it interaction 'Draw
+        Zones' uses: an idealized default shape rarely lines up with the
+        real photographed maze's exact size/rotation/skew as well as
+        tracing it by hand does, and dragging 4+ corners per zone to fix
+        that was fiddly. So this now just starts a normal 'zones' op
+        (start_op, same as clicking 'Draw Zones'), tagged with this
+        template so the per-zone naming prompt suggests its zone names, in
+        order, as each shape is drawn (see _next_auto_zone_name) -- pick
+        the shape tool that fits (Line/Arm for a maze arm, Rectangle for a
+        chamber, ...), draw each zone over the real maze, confirm or
+        rename its suggested name, repeat."""
         if self.pending_matrix is None:
             QMessageBox.critical(self, "Arena needed", "Use 'Crop Arena' or 'No Crop' first.")
             return
-        try:
-            params = {pkey: default for pkey, _label, default, _kind in MAZE_TEMPLATES[key]["params"]}
-            zones = MAZE_TEMPLATES[key]["generate"](self.pending_warp_w, self.pending_warp_h, params)
-        except Exception as exc:
-            QMessageBox.critical(self, "Could not generate zones", str(exc))
-            return
-        self.start_template_zone_op(key, zones)
+        self.start_op("zones", template_key=key)
 
     # ------------------------------------------------------------------
     # Embedded operations: Crop / Mask / Zones / Objects / Distance
@@ -669,7 +606,12 @@ class MainWindow(QMainWindow):
     # frame coordinates before calling on_canvas_press/drag/release.
     # ------------------------------------------------------------------
 
-    def start_op(self, kind):
+    def start_op(self, kind, template_key=None):
+        """template_key: set only by quick_setup_template (an apparatus
+        tile in 'Quick Setup') -- tags the op so the per-zone naming
+        prompt suggests that apparatus's own zone names, in order, as
+        each shape is drawn (see _next_auto_zone_name/prompt_zone_label).
+        Plain 'Draw Zones' leaves this None, same as before."""
         if kind == "crop":
             base_frame = self.get_active_raw_frame()
             if base_frame is None:
@@ -687,9 +629,12 @@ class MainWindow(QMainWindow):
         names = []
         if kind == "zones":
             names = [n.strip() for n in self.setup_page.roi_names_entry.text().split(",") if n.strip()]
-            if not names:
-                QMessageBox.critical(self, "Zone names needed", "Enter zone names first (e.g. Light,Dark).")
-                return
+            # Typing names first is still supported (backward compatible),
+            # but no longer required: leave the field blank and Draw Zones
+            # starts with one ready-to-draw zone instead -- select its line
+            # (or box/oval outline), and you're asked to name it the moment
+            # you finish drawing it (see _maybe_prompt_new_zone_name), one
+            # zone at a time, instead of typing every name up front.
         if kind == "objects":
             names = [n.strip() for n in self.setup_page.object_names_entry.text().split(",") if n.strip()]
             if not names:
@@ -698,7 +643,7 @@ class MainWindow(QMainWindow):
 
         self.set_active_tool(kind)
 
-        op = {"kind": kind, "drag": None, "_base_frame": base_frame}
+        op = {"kind": kind, "drag": None, "_base_frame": base_frame, "template_key": template_key}
         if kind == "crop":
             saved = self.pending_crop_corners
             op["shapes"] = [list(saved)] if saved and len(saved) == 4 else [[]]
@@ -707,7 +652,18 @@ class MainWindow(QMainWindow):
         elif kind in ("zones", "objects"):
             existing = self.pending_roi_points if kind == "zones" else self.pending_object_points
             op["regions"] = {n: list(existing.get(n, [])) for n in names}
-            op["active_region"] = names[0]
+            # auto_named: zones that don't have a real, typed name yet --
+            # either because roi_names_entry was left blank (below) or
+            # because op_new_zone added one -- get asked for their name the
+            # instant their shape is finished (see _maybe_prompt_new_zone_name).
+            # A zone typed into roi_names_entry already has its real name,
+            # so it's never in this set and is left alone, same as before.
+            op["auto_named"] = set()
+            if kind == "zones" and not op["regions"]:
+                first_name = self._next_auto_zone_name(op)
+                op["regions"][first_name] = []
+                op["auto_named"].add(first_name)
+            op["active_region"] = next(iter(op["regions"]), None)
             # Shape-drawing mode (Freehand/Rectangle/Ellipse/Line) + optional
             # snap-to-grid, both reset to defaults each time an op starts --
             # see op_set_draw_mode/op_toggle_snap and on_canvas_press/drag.
@@ -719,12 +675,14 @@ class MainWindow(QMainWindow):
 
         self._op = op
         self.setup_page.show_op_bar(kind)
+        self.setup_page.reset_canvas_title()
         self.setup_page.refresh_canvas()
 
     def cancel_op(self):
         self._op = None
         self.set_active_tool(None)
         self.setup_page.hide_op_bar()
+        self.setup_page.reset_canvas_title()
         self.setup_page.refresh_canvas()
 
     def finish_op(self):
@@ -748,6 +706,15 @@ class MainWindow(QMainWindow):
             self.pending_mask_points = [s for s in op["shapes"] if len(s) >= 3]
 
         elif op["kind"] in ("zones", "objects"):
+            # Drop any auto-named placeholder that was never actually drawn
+            # into -- e.g. the empty "Zone 3" left ready-to-draw after the
+            # last real one was finished (see _maybe_prompt_new_zone_name,
+            # which advances to a fresh blank zone after every completed
+            # shape). That's just bookkeeping for "ready in case you want
+            # another one", not a half-finished zone to warn about.
+            auto_named = op.get("auto_named", set())
+            for empty_name in [n for n, pts in op["regions"].items() if not pts and n in auto_named]:
+                del op["regions"][empty_name]
             incomplete = [n for n, pts in op["regions"].items() if len(pts) < 3]
             if incomplete:
                 noun = "zones" if op["kind"] == "zones" else "objects"
@@ -755,6 +722,14 @@ class MainWindow(QMainWindow):
                 return
             if op["kind"] == "zones":
                 self.pending_roi_points = dict(op["regions"])
+                # roi_names_entry is read elsewhere (CSV column naming, arm
+                # entries/alternation) rather than from pending_roi_points
+                # directly -- keep it in sync with whatever names were
+                # actually used, same as the template_zones branch below.
+                # Matters most for the blank-ROI-names-entry flow (draw
+                # first, name each zone as you finish it): without this,
+                # the field would stay empty even though real zones exist.
+                self.setup_page.set_roi_names_text(", ".join(op["regions"].keys()))
             else:
                 self.pending_object_points = dict(op["regions"])
 
@@ -802,22 +777,53 @@ class MainWindow(QMainWindow):
             self.setup_page.update_op_instructions()
             self.setup_page.refresh_canvas()
 
+    def _next_auto_zone_name(self, op):
+        """The name to pre-fill for the next not-yet-drawn zone. When this
+        op has a template_key (started from a Quick Setup apparatus tile --
+        see quick_setup_template), returns that apparatus's next UNUSED
+        suggested zone name in the template's own order (e.g. EPM: 'Center',
+        then 'Open Arm 1', 'Open Arm 2', 'Closed Arm 1', 'Closed Arm 2') --
+        prompt_zone_label's dialog pre-fills its combo box with this, so
+        drawing each arm in turn and clicking OK walks straight through the
+        template's checklist. Falls back to a plain 'Zone N' once every
+        suggestion is used (draw more zones than the template expects and
+        it just keeps counting) or when there's no template at all (plain
+        Draw Zones, unchanged from before)."""
+        template_key = op.get("template_key")
+        if template_key:
+            try:
+                suggestions = [label for label, _ in MAZE_TEMPLATES[template_key]["generate"](
+                    self.pending_warp_w, self.pending_warp_h,
+                    {p[0]: p[2] for p in MAZE_TEMPLATES[template_key]["params"]})]
+            except Exception:
+                suggestions = []
+            used = set(op["regions"].keys())
+            for label in suggestions:
+                if label not in used:
+                    return label
+        n = 1
+        while f"Zone {n}" in op["regions"]:
+            n += 1
+        return f"Zone {n}"
+
     def op_new_zone(self):
-        """Draw Zones: add another empty, auto-named zone (Zone 1, Zone 2,
-        ...) without needing to type its real name in the ROI names field
-        first -- trace the outline now, then click INSIDE it afterwards to
-        assign the real name (same click-to-rename popup Maze Template
-        uses). Lets you draw all N shapes for a maze first and only decide
-        which is which once you can see them next to each other, instead
-        of committing to names before anything is on screen."""
+        """Draw Zones: add another empty, auto-named zone (see
+        _next_auto_zone_name -- either a template's next suggested name, or
+        a plain 'Zone N') without needing to type its real name in the ROI
+        names field first -- trace its outline (Rectangle/Ellipse/Line
+        finish it and ask for the real name right away -- see
+        _maybe_prompt_new_zone_name -- freehand instead waits for a click
+        INSIDE it afterwards, or Finish) instead of committing to a name
+        before anything is on screen. Also called automatically after each
+        shape drawn with the Rectangle/Ellipse/Line tools finishes, so a
+        row of lines/boxes can be drawn back-to-back without reaching for
+        this button every time."""
         if not (self._op and self._op["kind"] == "zones"):
             return
-        n = 1
-        while f"Zone {n}" in self._op["regions"]:
-            n += 1
-        new_name = f"Zone {n}"
+        new_name = self._next_auto_zone_name(self._op)
         self._op["regions"][new_name] = []
         self._op["active_region"] = new_name
+        self._op.setdefault("auto_named", set()).add(new_name)
         self.setup_page.rebuild_region_buttons()
         self.setup_page.update_op_instructions()
         self.setup_page.refresh_canvas()
@@ -932,41 +938,19 @@ class MainWindow(QMainWindow):
         elif op["kind"] == "distance":
             return f"Click 2 points of known real-world distance ({len(op['points'])}/2 placed)."
         elif op["kind"] == "template_zones":
-            if op.get("_align_target_index") is not None:
-                return (f"{len(op['regions'])} zone(s) from the template. Drag corners to fit THIS video's "
-                        "own framing, then Finish to save just this video's alignment (other queued videos "
-                        "are unaffected).")
-            return (f"{len(op['regions'])} zone(s) generated. Drag a corner on the canvas to fix alignment "
-                    "with the maze. To rename a zone (e.g. swap which arm is Open/Closed), click its name "
-                    "below -- clicking the canvas never pops up a rename prompt by itself. Then Finish.")
+            # Only reachable from on_align_video (Batch queue's per-video
+            # "Align" button) now -- Quick Setup draws/names new zones the
+            # normal way (kind="zones") instead, see quick_setup_template.
+            return (f"{len(op['regions'])} zone(s) from the template. Drag corners to fit THIS video's "
+                    "own framing, then Finish to save just this video's alignment (other queued videos "
+                    "are unaffected).")
         return ""
 
-    # -- maze templates: geometry-driven zone generation, then click-to-confirm/rename --
-
-    def start_template_zone_op(self, template_key, zones):
-        base_frame = self.get_warped_active_frame()
-        if base_frame is None:
-            QMessageBox.critical(self, "No video", "Add and select a video first.")
-            return
-
-        self.set_active_tool("maze")
-
-        # Suggested labels from the template can collide with each other in
-        # freak cases -- de-dupe by appending a counter rather than
-        # silently dropping a zone.
-        regions = {}
-        for label, pts in zones:
-            name = label
-            n = 2
-            while name in regions:
-                name = f"{label} ({n})"
-                n += 1
-            regions[name] = [tuple(p) for p in pts]
-
-        self._op = {"kind": "template_zones", "drag": None, "_base_frame": base_frame,
-                    "regions": regions, "template_key": template_key}
-        self.setup_page.show_op_bar("template_zones")
-        self.setup_page.refresh_canvas()
+    # -- "template_zones": a drag-corners-only op kind, still used by
+    # on_align_video (Batch queue's per-video "Align" button) to nudge an
+    # ALREADY-drawn/named set of zones to fit a different video's framing --
+    # not for creating/naming new zones anymore (Quick Setup/quick_setup_template
+    # draws and names those the normal 'zones' way now; see its docstring). --
 
     def prompt_zone_label(self, op, current_name):
         """Popup shown after clicking a template-generated zone on the
@@ -985,6 +969,36 @@ class MainWindow(QMainWindow):
         existing_names = set(op["regions"].keys()) - {current_name}
         from qt_app.dialogs.zone_label_dialog import prompt_zone_label as _prompt
         return _prompt(self, current_name, suggestions, existing_names)
+
+    def _maybe_prompt_new_zone_name(self, op, name):
+        """Draw Zones, Rectangle/Ellipse/Line tools only: called right after
+        a shape finishes (mouse released -- see on_canvas_release), this is
+        what makes 'select the shape's 1-2 points, then name it on the
+        spot' work -- MM asked for this after sketching a maze frame with
+        lines drawn straight onto it, each meant to be named the moment
+        it's placed, rather than typing every zone's name up front or
+        clicking back into a finished shape later to rename it.
+
+        Only fires for a zone that doesn't have a real name yet (still in
+        op['auto_named'] -- see start_op/op_new_zone); a zone typed into
+        roi_names_entry already has its real name and is left alone.
+        Freehand zones are a multi-click shape with no single 'done'
+        moment, so they keep the older click-inside/Finish-then-rename
+        flow instead of auto-prompting after every click."""
+        pts = op["regions"].get(name, [])
+        if len(pts) < 3 or name not in op.get("auto_named", set()):
+            return
+        new_name = self.prompt_zone_label(op, name)
+        if new_name and new_name != name:
+            op["regions"][new_name] = op["regions"].pop(name)
+            if op["active_region"] == name:
+                op["active_region"] = new_name
+            op["auto_named"].discard(name)
+        self.setup_page.rebuild_region_buttons()
+        # Ready for the next line/box/oval immediately -- drawing several
+        # zones in a row (an EPM's arms + center, say) shouldn't need a
+        # fresh "New Zone" click after every single one.
+        self.op_new_zone()
 
     def op_rename_template_zone(self, current_name):
         """Called from the explicit per-zone button in the op bar (not a
@@ -1066,10 +1080,10 @@ class MainWindow(QMainWindow):
                 op["drag"] = ("newshape", op["active_region"])
             else:
                 # 3) Freehand: a click INSIDE a different, already-completed
-                # zone opens the confirm/rename popup for that zone (same as
-                # Maze Template) instead of adding a point to the active
-                # one -- draw all the shapes first, then click each to
-                # name it, rather than typing every name up front.
+                # zone opens the confirm/rename popup for that zone instead
+                # of adding a point to the active one -- draw all the
+                # shapes first, then click each to name it, rather than
+                # typing every name up front.
                 clicked_other = None
                 for name, pts in op["regions"].items():
                     if name != op["active_region"] and len(pts) >= 3 and self._point_in_polygon((fx, fy), pts):
@@ -1158,9 +1172,16 @@ class MainWindow(QMainWindow):
         op = self._op
         if op is None:
             return
+        finished_shape_name = None
         if op.get("drag") and op["drag"][0] == "newshape":
+            finished_shape_name = op["drag"][1]
             op.pop("_shape_anchor", None)
         op["drag"] = None
+        if finished_shape_name is not None and op["kind"] == "zones":
+            # Rectangle/Ellipse/Line only (freehand never sets a "newshape"
+            # drag -- on_canvas_press adds points one at a time for it
+            # instead) -- see _maybe_prompt_new_zone_name.
+            self._maybe_prompt_new_zone_name(op, finished_shape_name)
 
     # ------------------------------------------------------------------
     # Reset handlers
@@ -1338,6 +1359,134 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(max(0, min(100, int(fraction * 100))))
         self.progress_label.setText(f"{fraction * 100:.0f}%")
         QApplication.processEvents()
+
+    def on_live_tracking_frame(self, frame_bgr):
+        """frame_callback for process_single_video (see the comment above
+        its call in _run_standard_flow for why this replaces cv2.imshow):
+        draws the same annotated AUTO TRACK frame straight into the Setup
+        page's own preview canvas every few frames while tracking runs, so
+        MM can watch the dot follow the animal live instead of only a
+        percentage bar (his "i need to see the screen of tracking" ask).
+        Safe to no-op if the canvas isn't around for some reason (e.g. this
+        ran from a script/test with no Setup page built)."""
+        sp = getattr(self, "setup_page", None)
+        if sp is None or getattr(sp, "canvas", None) is None:
+            return
+        sp.canvas_title_label.setText("Preview / Calibration -- Live tracking")
+        sp.canvas.display_frame(frame_bgr)
+        QApplication.processEvents()
+
+    def on_preview_background(self):
+        """'Preview Background' toolbar button (Draw Zones toolbar): MM's
+        "i need reference image to display and empty frame image to see
+        and confirm" ask. Computes the SAME median background image
+        process_single_video will use for motion detection, and grabs one
+        real frame (with the animal in it, from partway through the chosen
+        time window) as a reference alongside it, then shows both side by
+        side -- with the current zones/mask/objects drawn on top of each,
+        exactly like the real run -- in the preview canvas, so a bad
+        background (e.g. a mouse-shaped smudge baked in because it sat
+        still too long) is obvious before spending time on a full run,
+        without ever needing the cv2.imshow confirm step that used to gate
+        this and crashes this Qt build (see the comment above the
+        Individual-mode process_single_video call for why).
+        """
+        if self.active_index is None or not self.videos:
+            QMessageBox.critical(self, "No video", "Add and select a video first.")
+            return
+        if self.pending_matrix is None:
+            QMessageBox.critical(self, "Arena not set", "Use 'Crop Arena' or 'No Crop' first.")
+            return
+
+        video_path = self.videos[self.active_index]["path"]
+        setup = self._build_setup(video_path)
+        if setup is None:
+            return
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            QMessageBox.critical(self, "Could not open video", f"Could not open:\n{video_path}")
+            return
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps else 0.0
+            start_time = max(0.0, min(setup["start_time"], duration))
+            end_time = max(start_time, min(setup["end_time"], duration))
+            start_frame = int(start_time * fps)
+            end_frame = max(start_frame, int(end_time * fps) - 1)
+
+            self.status_label.setText("Computing background...")
+            QApplication.processEvents()
+            background = make_background(
+                cap, start_frame, end_frame, setup["matrix"], setup["warp_w"], setup["warp_h"],
+                setup["background_samples"], color_mode=setup["color_mode"],
+            )
+
+            mid_frame = (start_frame + end_frame) // 2
+            reference = read_and_warp(cap, mid_frame, setup["matrix"], setup["warp_w"], setup["warp_h"])
+        finally:
+            cap.release()
+
+        if background is None or reference is None:
+            QMessageBox.critical(self, "Preview failed",
+                                  "Couldn't read frames from this video to build a preview.")
+            self.status_label.setText("Idle.")
+            return
+
+        # Reuse the exact same overlay drawing the live canvas uses, so the
+        # zones/mask/objects shown here line up pixel-for-pixel with what
+        # the real run will see -- draw_overlays reads pending_roi_points
+        # etc. straight off self (MainWindow), same as PreviewCanvas.refresh().
+        # make_background() returns a single-channel image in "gray" color
+        # mode (the common/default case) -- draw_overlays/cv2 drawing calls
+        # and the RGB conversion in display_frame all expect 3 channels.
+        if background.ndim == 2:
+            background = cv2.cvtColor(background, cv2.COLOR_GRAY2BGR)
+        ref_annotated = draw_overlays(reference, self)
+        bg_annotated = draw_overlays(background, self)
+        composed = self._side_by_side_preview(
+            ref_annotated, "REFERENCE (with animal)", bg_annotated, "BACKGROUND (should be empty)"
+        )
+
+        self.setup_page.canvas_title_label.setText(
+            "Preview / Calibration -- Reference vs. background (click any tool to go back)"
+        )
+        self.setup_page.canvas.display_frame(composed)
+        self.status_label.setText(
+            "Background preview ready. If a mouse-shaped smudge shows on the right, raise "
+            "'Background samples' or pick a time window where the animal moves more, then "
+            "preview again."
+        )
+
+    @staticmethod
+    def _side_by_side_preview(left_bgr, left_label, right_bgr, right_label):
+        """Stacks two same-sized BGR frames horizontally with a small
+        caption baked into each half, for on_preview_background -- lets the
+        existing single-frame preview canvas show two images to compare at
+        once without adding a whole second widget just for this."""
+        h = max(left_bgr.shape[0], right_bgr.shape[0])
+        w = max(left_bgr.shape[1], right_bgr.shape[1])
+
+        def _pad(frame):
+            if frame.shape[:2] == (h, w):
+                return frame.copy()
+            canvas = np.zeros((h, w, 3), dtype=frame.dtype)
+            fh, fw = frame.shape[:2]
+            canvas[:fh, :fw] = frame
+            return canvas
+
+        left = _pad(left_bgr)
+        right = _pad(right_bgr)
+        gap = np.full((h, 6, 3), 40, dtype=np.uint8)
+        combined = np.hstack([left, gap, right])
+
+        for label, x_off in ((left_label, 10), (right_label, w + gap.shape[1] + 10)):
+            cv2.putText(combined, label, (x_off, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(combined, label, (x_off, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+        return combined
 
     def _qt_confirm(self, title, prompt):
         """Passed to process_single_video as confirm_callback -- replaces
@@ -1531,29 +1680,36 @@ class MainWindow(QMainWindow):
                 # hard-crash it (confirmed: cv2.imshow aborts the process
                 # outright rather than raising a catchable exception, the
                 # moment both toolkits are active together). The interactive
-                # "confirm the background"/"press a key to advance the
-                # detection preview" steps that show_display=True used to
-                # gate are skipped, but nothing is lost: run_detection_preview
-                # still saves every preview frame to disk unconditionally,
-                # and the Results page's Reference Frames gallery below is
-                # exactly those same images, so sanity-checking detection is
-                # still available -- just after the run instead of during it,
-                # the same way Batch mode has always worked here.
+                # cv2.imshow "confirm the background"/"press a key to
+                # advance the detection preview" steps that show_display=True
+                # used to gate are skipped -- but not lost: "Preview
+                # Background" (on_preview_background, below) covers the
+                # pre-run confirmation in a plain Qt image instead, and
+                # frame_callback=self.on_live_tracking_frame draws the same
+                # live AUTO TRACK overlay this cv2 window would have shown,
+                # straight into the preview canvas, without ever touching
+                # cv2.imshow. run_detection_preview also still saves every
+                # preview frame to disk unconditionally, and the Results
+                # page's Reference Frames gallery below is exactly those.
                 summary = process_single_video(active_path, base_setup, show_display=False,
                                                progress_callback=self.on_progress,
-                                               confirm_callback=self._qt_confirm)
+                                               confirm_callback=self._qt_confirm,
+                                               frame_callback=self.on_live_tracking_frame)
             except SystemExit as exc:
                 self.status_label.setText(f"Stopped: {exc}")
                 cv2.destroyAllWindows()
+                self.setup_page.reset_canvas_title()
                 return
             except Exception as exc:
                 self.status_label.setText(f"Error: {type(exc).__name__}")
                 cv2.destroyAllWindows()
+                self.setup_page.reset_canvas_title()
                 QMessageBox.critical(self, "Tracking Error",
                                       f"An error occurred during tracking:\n\n{type(exc).__name__}: {exc}")
                 return
             self.progress_bar.setValue(100)
             self.status_label.setText("Done.")
+            self.setup_page.reset_canvas_title()
             try:
                 self.results_page.show_standard(summary)
                 self.show_results_page()
@@ -1611,10 +1767,13 @@ class MainWindow(QMainWindow):
                 # Tkinter app's own batch behavior: with show_display=True,
                 # every video in the batch would pop up its own blocking
                 # "press a key to continue" step, stalling an unattended
-                # batch run N times over.
+                # batch run N times over. frame_callback still draws a live
+                # view into the preview canvas for whichever video is
+                # currently processing, same as Individual mode.
                 summary = process_single_video(v["path"], setup, show_display=False,
                                                progress_callback=self.on_progress,
-                                               confirm_callback=self._qt_confirm)
+                                               confirm_callback=self._qt_confirm,
+                                               frame_callback=self.on_live_tracking_frame)
                 summary["subject_id"] = v.get("subject_id", "")
                 summaries.append(summary)
             except SystemExit as exc:
@@ -1628,6 +1787,7 @@ class MainWindow(QMainWindow):
 
         cv2.destroyAllWindows()
         self.progress_bar.setValue(100)
+        self.setup_page.reset_canvas_title()
 
         if summaries:
             batch_df = pd.DataFrame(summaries)
@@ -2131,12 +2291,9 @@ class MainWindow(QMainWindow):
         return ""
 
     # ------------------------------------------------------------------
-    # Dialogs (Maze Template, Manual Scoring, ML classifier)
+    # Dialogs (Manual Scoring, ML classifier) -- the old Maze Template
+    # dialog is gone; see quick_setup_template's docstring for why.
     # ------------------------------------------------------------------
-
-    def on_open_maze_template_dialog(self):
-        from qt_app.dialogs.maze_template_dialog import open_maze_template_dialog
-        open_maze_template_dialog(self, self)
 
     def on_manual_behavior_scoring(self):
         if not self.videos:
