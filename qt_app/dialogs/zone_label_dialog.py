@@ -1,10 +1,13 @@
 """
 Zone rename dialog -- the Qt equivalent of TrackerApp._prompt_zone_label in
-gui/main_window.py. Shown when a researcher clicks a template-generated
-zone on the preview canvas (the "select instead of freehand-draw" flow the
-Maze Template / Quick Setup pipeline uses): confirm the geometry's guess,
-pick one of the template's other suggested names (e.g. swap which arm is
-actually "Open"), or type a custom name.
+gui/main_window.py. Shown the moment a shape finishes while drawing zones
+(Draw Zones, or a Quick Setup apparatus tile -- see
+MainWindow._maybe_prompt_new_zone_name/_next_auto_zone_name): confirm the
+suggested name (a plain "Zone N", or the apparatus's own next zone name
+when a Quick Setup template started this op), pick a different suggestion
+from the dropdown, or type a custom name. Also used by
+op_rename_template_zone for the Batch queue's per-video "Align" op, to
+rename one of an already-aligned set of zones from its own op-bar button.
 """
 
 from PySide6.QtWidgets import (
