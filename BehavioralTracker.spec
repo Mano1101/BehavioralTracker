@@ -47,7 +47,14 @@ if os.path.isdir(res_dir):
 
 a = Analysis(
     ["main.py"],
-    pathex=[],
+    # This project's own top-level packages (analysis/, output/, tracking/,
+    # qt_app/, gui/) all sit next to main.py/this .spec file. PyInstaller's
+    # static import scan normally finds them fine with pathex=[] as long as
+    # `pyinstaller` is run FROM this directory, but naming this directory
+    # explicitly makes that not depend on the caller's cwd, and is cheap
+    # insurance against exactly the "No module named 'analysis'" class of
+    # error a stale/incomplete build can otherwise produce.
+    pathex=[SPECPATH],
     binaries=list(extra_binaries),
     datas=datas,
     hiddenimports=[
@@ -62,6 +69,20 @@ a = Analysis(
         # collected below with --collect-all)
         "matplotlib.backends.backend_agg",
         "matplotlib.backends.backend_tkagg",
+        # This project's own local packages -- listed explicitly (belt and
+        # suspenders alongside PyInstaller's normal static-import scan) so
+        # a rebuild can never silently drop one of them the way a stale
+        # build/ cache did once before (see README's troubleshooting note).
+        "analysis",
+        "analysis.calculations",
+        "analysis.custom_variables",
+        "analysis.custom_report",
+        "analysis.statistics",
+        "output",
+        "output.csv",
+        "output.excel",
+        "output.graphs",
+        "tracking",
         *extra_hiddenimports,
     ],
     hookspath=[],
