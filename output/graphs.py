@@ -26,17 +26,10 @@ def _reference_frame_rgb(background):
 
 def save_plots(df, output_dir, roi_points, object_points, warp_w, warp_h, background=None,
                x_col="Mouse_X", y_col="Mouse_Y"):
-    """x_col/y_col default to the real, raw per-frame position columns;
-    tracking.location.process_single_video points them at
-    Mouse_X_smooth/Mouse_Y_smooth instead when Trajectory smoothing was
-    requested (see smooth_trajectory there), so both charts below reflect
-    whichever the researcher asked for without this module needing to know
-    anything about how that smoothing works."""
     valid = df[df["Tracking_Status"] == "Tracked"].copy()
     if valid.empty:
         return
 
-    smoothed = x_col != "Mouse_X"
     ref_rgb = _reference_frame_rgb(background)
 
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -47,6 +40,9 @@ def save_plots(df, output_dir, roi_points, object_points, warp_w, warp_h, backgr
     # location trace) rather than one flat color, so direction of travel
     # and where-the-animal-was-when are both visible at a glance -- a flat
     # line only shows the SHAPE of the path, not its time course.
+    # x_col/y_col default to the raw Mouse_X/Mouse_Y columns, but the caller
+    # points these at Mouse_X_smooth/Mouse_Y_smooth instead when trajectory
+    # smoothing was requested (see tracking/location.py).
     xy = valid[[x_col, y_col]].to_numpy()
     t = valid["Time_seconds"].to_numpy()
     if len(xy) >= 2:
@@ -77,7 +73,7 @@ def save_plots(df, output_dir, roi_points, object_points, warp_w, warp_h, backgr
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("X (pixels)")
     ax.set_ylabel("Y (pixels)")
-    ax.set_title("Mouse Trajectory (smoothed)" if smoothed else "Mouse Trajectory")
+    ax.set_title("Mouse Trajectory")
 
     fig.savefig(os.path.join(output_dir, "trajectory.png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -105,7 +101,7 @@ def save_plots(df, output_dir, roi_points, object_points, warp_w, warp_h, backgr
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("X (pixels)")
     ax.set_ylabel("Y (pixels)")
-    ax.set_title("Mouse Occupancy Heatmap (smoothed)" if smoothed else "Mouse Occupancy Heatmap")
+    ax.set_title("Mouse Occupancy Heatmap")
     fig.colorbar(im, ax=ax, label="Relative occupancy")
 
     fig.savefig(os.path.join(output_dir, "heatmap.png"), dpi=200, bbox_inches="tight")
