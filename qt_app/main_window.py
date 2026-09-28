@@ -165,6 +165,15 @@ class MainWindow(QMainWindow):
         # reopening the tool starts from what was last drawn, same as
         # pending_mask_points does for Mask Zone.
         self.pending_zone_lines = []
+        # Which tool last WROTE pending_roi_points -- "lines" (Draw Zone
+        # Lines' auto-detected partitions) or "manual" (Draw Zones, hand-
+        # drawn/edited). Draw Zones and Draw Zone Lines are two alternative
+        # ways to define the same zones, not two tools meant to be mixed:
+        # start_op reads this so opening Draw Zones right after a Draw Zone
+        # Lines run starts from a blank slate instead of silently pre-
+        # loading the auto-detected (many-point, not meant to be hand-
+        # edited) partition shapes under their auto-picked A/B/C names.
+        self._roi_points_source = None
         self.pending_scale_factor = None
         self.pending_scale_unit = None
 
@@ -718,6 +727,7 @@ class MainWindow(QMainWindow):
         self.pending_object_points = {}
         self.pending_mask_points = []
         self.pending_zone_lines = []
+        self._roi_points_source = None
         self.setup_page.refresh_canvas()
 
     # ------------------------------------------------------------------
@@ -770,7 +780,19 @@ class MainWindow(QMainWindow):
         elif kind == "zone_lines":
             op["shapes"] = [list(p) for p in self.pending_zone_lines] if self.pending_zone_lines else [[]]
         elif kind in ("zones", "objects"):
-            existing = self.pending_roi_points if kind == "zones" else self.pending_object_points
+            # Draw Zones only resumes PREVIOUSLY HAND-DRAWN zones. If the
+            # current pending_roi_points instead came from Draw Zone Lines'
+            # auto-detected partitions (self._roi_points_source == "lines"),
+            # treat this as switching tools to start fresh by hand rather
+            # than silently loading those many-point auto-traced shapes in
+            # under their auto-picked A/B/C names -- see _roi_points_source's
+            # own comment in __init__. roi_names_entry (and so `names`
+            # above) is left alone either way, so the same names can just
+            # be redrawn by hand if that's what's wanted.
+            if kind == "zones" and self._roi_points_source == "lines":
+                existing = {}
+            else:
+                existing = self.pending_roi_points if kind == "zones" else self.pending_object_points
             op["regions"] = {n: list(existing.get(n, [])) for n in names}
             # auto_named: zones that don't have a real, typed name yet --
             # either because roi_names_entry was left blank (below) or
@@ -836,6 +858,7 @@ class MainWindow(QMainWindow):
                 return
             self.pending_zone_lines = strokes
             self.pending_roi_points = partitions
+            self._roi_points_source = "lines"
             self.setup_page.set_roi_names_text(", ".join(partitions.keys()))
             self.status_label.setText(
                 f"Detected {len(partitions)} zone(s): {', '.join(partitions.keys())} -- "
@@ -859,6 +882,7 @@ class MainWindow(QMainWindow):
                 return
             if op["kind"] == "zones":
                 self.pending_roi_points = dict(op["regions"])
+                self._roi_points_source = "manual"
                 # roi_names_entry is read elsewhere (CSV column naming, arm
                 # entries/alternation) rather than from pending_roi_points
                 # directly -- keep it in sync with whatever names were
@@ -897,6 +921,7 @@ class MainWindow(QMainWindow):
                 self.setup_page.refresh_video_list()
             else:
                 self.pending_roi_points = dict(op["regions"])
+                self._roi_points_source = "manual"
                 # roi_names_entry is read elsewhere (CSV column naming, arm
                 # entries/alternation) rather than from pending_roi_points
                 # directly -- keep it in sync with whatever the researcher
@@ -1306,6 +1331,7 @@ class MainWindow(QMainWindow):
         self.pending_object_points = {}
         self.pending_mask_points = []
         self.pending_zone_lines = []
+        self._roi_points_source = None
         self.pending_scale_factor = None
         self.pending_scale_unit = None
         self._op = None
