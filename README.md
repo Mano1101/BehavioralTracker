@@ -4,8 +4,17 @@ Automatic rodent tracking for behavioral video, with configurable zones,
 optional interaction objects, multi-mouse ID-matched tracking, a
 grooming/rearing/locomotion behavior classifier (rule-based, or an optional
 trained deep-learning model), manual behavior scoring, maze/arena templates,
-and batch processing. No pose estimation, no manual per-frame animal
-selection.
+and batch processing (all three analysis types). No pose estimation, no
+manual per-frame animal selection.
+
+Also includes a set of features brought in from EthoVision XT and SMART
+3.0 (see "Upgrade Plan" in the roadmap below): configurable stop
+conditions, a Subject Database with real experimental metadata, Zone
+Associations (combining zones for reporting without redrawing), a
+trajectory smoothing/outlier filter, live camera acquisition, sandboxed
+custom variables/derived columns, a real Settings screen, configurable
+time-bin reporting for every analysis type, and a custom report builder
+on the Results screen.
 
 ## Two GUIs, one unchanged engine
 
@@ -46,15 +55,28 @@ AnimalBehaviourTracker/
 │   ├── widgets/                preview_canvas.py, results_charts.py
 │   ├── dialogs/                maze_template_dialog.py, manual_scoring_dialog.py,
 │   │                            ml_dataset_dialog.py, ml_train_dialog.py,
-│   │                            zone_label_dialog.py
+│   │                            zone_label_dialog.py, camera_dialog.py (live
+│   │                            camera acquisition), settings_dialog.py (the
+│   │                            Settings screen), report_builder_dialog.py
+│   │                            (Custom Report builder)
+│   ├── app_settings.py        persisted Detection Settings defaults + app-wide
+│   │                            preferences (~/.behavioraltracker/settings.json)
 │   └── tests/                  headless regression suite (run_all.py runs it all)
 ├── gui/
 │   └── main_window.py        Tkinter dashboard window + every setup dialog
 ├── tracking/
 │   ├── location.py           detection engine + the main per-video (single-mouse) pipeline
 │   ├── two_mouse.py           multi-mouse background-subtract + ID-matched tracking
-│   ├── behavior.py            grooming/rearing/locomotion feature extraction + classifier + manual scoring
-│   ├── behaviour.py           (older, British spelling) interaction-bout tagging/binning helpers used by location.py
+│   │                            (also calculate_time_bins -- Multi-Mouse's
+│   │                            configurable time-bin report)
+│   ├── behavior.py            grooming/rearing/locomotion feature extraction + classifier
+│   │                            + manual scoring (also calculate_behavior_time_bins and
+│   │                            behavior_summary_table -- Behavior Classification's
+│   │                            time-bin report and Custom Report stats table)
+│   ├── behaviour.py           (older, British spelling) interaction-bout tagging/binning
+│   │                            helpers used by location.py, incl. the shared bin-edge/
+│   │                            label helpers (format_bin_label/compute_bin_edges/
+│   │                            bin_row_label) every analysis type's time-bin report uses
 │   ├── interaction.py         object-proximity bout extraction
 │   ├── epm.py                  arm entries / spontaneous alternation
 │   ├── maze_templates.py      built-in maze/arena zone-geometry templates
@@ -64,10 +86,15 @@ AnimalBehaviourTracker/
 │   └── ml_infer.py             runs a trained model over a video
 ├── analysis/
 │   ├── calculations.py       generic math helpers (distance, column naming)
+│   ├── custom_variables.py   sandboxed "name = expression" derived-column engine
+│   │                            (Setup page's Custom Variables panel, Standard Tracking)
+│   ├── custom_report.py      analysis-type-agnostic column-picking for the Custom
+│   │                            Report builder (Results page, all three analysis types)
 │   └── statistics.py         placeholder -- cross-group stats, not built yet
 ├── output/
 │   ├── csv.py                 raw_tracking.csv
-│   ├── excel.py                the multi-sheet .xlsx workbook
+│   ├── excel.py                the multi-sheet .xlsx workbook (Summary/Raw Tracking/
+│   │                            <bin> Individual+Cumulative/Transitions/etc.)
 │   └── graphs.py               trajectory.png / heatmap.png / zone_occupancy.png
 ├── resources/                  app icon (icon.png/.ico/.icns), wired into the window/taskbar icon
 ├── models/                     reserved for future ML/pose models -- unused
@@ -107,15 +134,23 @@ unchanged, for comparison or as a fallback.
    Tracking + Results (all 3 analysis types), Quick Setup apparatus
    templates, Manual Scoring, Deep Learning Classifier panel are all
    wired up in `qt_app/`.
-2. A dedicated Settings screen (Detection Settings currently live on the
-   Setup page itself, same as before).
+2. ~~A dedicated Settings screen~~ -- done (Upgrade Plan Tier 2 #8):
+   `qt_app/dialogs/settings_dialog.py` persists Detection Settings
+   defaults and a couple of app-wide preferences (default units, default
+   color mode) to `~/.behavioraltracker/settings.json`
+   (`qt_app/app_settings.py`), loaded straight into the same `_memory`
+   dict the Setup page's own fields already read -- so Save takes effect
+   on the current Setup page immediately, and a brand-new session starts
+   from these instead of the hardcoded fallbacks every time. Deliberately
+   excludes a theme preference -- dark/light mode was removed on purpose
+   (see `qt_app/theme.py`'s own docstring), not just hidden.
 3. ~~Full headless regression pass consolidated into a permanent test
-   suite~~ -- done: `qt_app/tests/` (6 suites -- core UI, Quick Setup
+   suite~~ -- done: `qt_app/tests/` (16 suites -- core UI, Quick Setup
    apparatus templates, Start Tracking/Results for all 3 analysis types,
-   Manual Scoring, the batch/subject/Excel-export features below, and the
-   Deep Learning Classifier pipeline end to end). Run with
-   `xvfb-run -a python3.12 qt_app/tests/run_all.py`; see
-   `qt_app/tests/README.md`.
+   Manual Scoring, the batch/subject/Excel-export features below, the
+   Deep Learning Classifier pipeline end to end, and every Upgrade Plan
+   feature below). Run with `xvfb-run -a python3.12 qt_app/tests/run_all.py`;
+   see `qt_app/tests/README.md`.
 4. ~~Batch mode per-video zone alignment, Subject database, Excel
    export~~ -- done, built after comparing against commercial competitors
    (SMART 3.0, ANY-maze): each queued video in Batch mode can have its own
@@ -143,3 +178,44 @@ unchanged, for comparison or as a fallback.
    (`python main.py`) is unaffected by any of this and has always used the
    real Qt GUI.
 6. Wrap the built exe in a proper installer.
+7. ~~Upgrade Plan: features brought in from EthoVision XT & SMART 3.0~~ --
+   done (Tier 1 + Tier 2 of the plan; Tier 3's hardware-trigger output and
+   true multi-point pose tracking were scoped separately and are still
+   out of scope). Ten features, each with its own regression suite in
+   `qt_app/tests/`:
+   1. Configurable stop conditions (Setup page, Standard Tracking) -- stop
+      after N seconds of continuous immobility, N zone entries, or a
+      total-distance threshold, in addition to the fixed End (s) time.
+   2. Richer Subject Database fields -- Code/Group/Color/Sex/Age/Genotype/
+      Phenotype/Treatment/Dose columns (when present in the imported
+      Excel file) carry into `BatchSummary.csv`/`.xlsx`, not just an ID.
+   3. Zone Associations -- combine 2+ existing zones into one named
+      reporting group (e.g. "Left Side" = Zone A + Zone B) without
+      redrawing anything.
+   4. Trajectory smoothing / outlier filter -- an optional post-processing
+      pass on `raw_tracking.csv` before the Trajectory/Heatmap charts, to
+      reduce single-frame detection jitter.
+   5. Batch mode for Multi-Mouse Tracking & Behavior Classification --
+      the batch loop that used to exist only for Standard Tracking now
+      covers all three analysis types.
+   6. Live camera acquisition -- a "Camera" button next to the video list
+      opens a live OpenCV `VideoCapture(index)` preview with a Record
+      button (`qt_app/dialogs/camera_dialog.py`), alongside file upload.
+   7. Custom variables / derived columns -- a sandboxed "name = expression"
+      panel (`analysis/custom_variables.py`, a hand-rolled AST whitelist
+      evaluator, not `eval()`/`df.eval()`) adds derived columns to the
+      exported CSV/Excel, e.g. `distance_cm = Distance_pixels / scale_factor`.
+   8. A real Settings screen -- see item 2 above.
+   9. Configurable time-bin reporting for every analysis type -- the bin
+      size behind Standard Tracking's "1min Individual"/"1min Cumulative"
+      sheets is now configurable (Setup page's shared "Time Bins"
+      panel, `bin_size_entry`), and the same idea was extended to
+      Multi-Mouse (distance/frames-tracked per mouse per bin) and
+      Behavior Classification (time-in-each-behavior per mouse per bin),
+      both of which had no time-bin report before.
+   10. Custom report builder -- a "Custom Report" button on the Results
+       page (all three analysis types) opens a checkbox picker
+       (`qt_app/dialogs/report_builder_dialog.py`) over whichever
+       computed-stats table that analysis type already builds, and saves
+       just the checked columns to `Custom_Report.csv`/`.xlsx`, instead of
+       always exporting the fixed Summary sheet shape.
