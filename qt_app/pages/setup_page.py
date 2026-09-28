@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
 
 from qt_app.theme import PALETTE
 from qt_app.widgets.preview_canvas import PreviewCanvas
-from tracking.maze_templates import TEMPLATES as MAZE_TEMPLATES
 
 # NOTE: PALETTE is one fixed dict now (dark mode was removed entirely --
 # see theme.py's docstring), so this no longer needs to stay reactive to a
@@ -52,15 +51,16 @@ class SetupPage(QWidget):
         "start_entry", "end_entry", "roi_names_entry", "object_names_entry",
         "interaction_margin_entry", "bg_samples_entry", "threshold_entry",
         "min_area_entry", "max_area_entry", "max_jump_entry",
-        "window_size_entry", "window_weight_entry", "real_distance_entry",
+        "real_distance_entry",
         "units_entry", "preview_samples_entry",
         "loco_thresh_entry", "rear_thresh_entry", "groom_thresh_entry",
         "immobile_thresh_entry", "min_bout_entry",
         "stop_value_entry", "stop_zone_entry", "zone_associations_entry",
+        "zone_formula_entry",
         "smooth_window_entry", "bin_size_entry",
     ]
     CHECK_ATTRS = [
-        "use_window_var", "use_zone_threshold_var", "reject_shadows_var",
+        "use_zone_threshold_var",
         "loc_var", "interact_var", "entries_var", "altern_var", "all_var",
         "behavior_rearing_var", "behavior_grooming_var", "behavior_locomotion_var",
         "behavior_immobile_var", "behavior_all_var", "ml_mode_var",
@@ -272,8 +272,8 @@ class SetupPage(QWidget):
             controls_row.addLayout(self.op_region_row)
             self.rebuild_template_zone_buttons()
 
-        if kind == "mask":
-            new_shape_btn = QPushButton("New Shape")
+        if kind in ("mask", "zone_lines"):
+            new_shape_btn = QPushButton("New Line" if kind == "zone_lines" else "New Shape")
             new_shape_btn.setObjectName("toolBtn")
             new_shape_btn.clicked.connect(self.app.op_new_shape)
             controls_row.addWidget(new_shape_btn)
@@ -712,32 +712,14 @@ class SetupPage(QWidget):
             "max_area_entry", default_max_area)
         self._setting_field(v, "Max movement / frame, px", "max_jump_entry", 100)
 
-        self.use_window_var = QCheckBox("Prior-position weighting")
         self.use_zone_threshold_var = QCheckBox("Per-zone adaptive threshold")
-        self.reject_shadows_var = QCheckBox("Reject shadows")
-        self.window_size_entry = None
-        self.window_weight_entry = None
 
         if mode == "standard":
-            self.use_window_var.setChecked(self.var_or_default("use_window_var", False))
-            v.addWidget(self.use_window_var)
-            self._setting_field(v, "  window size, px", "window_size_entry", 120)
-            self._setting_field(v, "  window weight (0-1)", "window_weight_entry", 0.5)
-
             self.use_zone_threshold_var.setChecked(self.var_or_default("use_zone_threshold_var", False))
             v.addWidget(self.use_zone_threshold_var)
-
-            self.reject_shadows_var.setChecked(self.var_or_default("reject_shadows_var", False))
-            v.addWidget(self.reject_shadows_var)
-            v.addWidget(_hint("(if the tracker keeps grabbing the animal's shadow instead of "
-                               "its body, try this)"))
         else:
-            self.use_window_var.setChecked(self.var_or_default("use_window_var", False))
             self.use_zone_threshold_var.setChecked(self.var_or_default("use_zone_threshold_var", False))
-            self.use_window_var.hide()
             self.use_zone_threshold_var.hide()
-            self.reject_shadows_var.setChecked(False)
-            self.reject_shadows_var.hide()
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
         v.addWidget(sep)
@@ -772,8 +754,14 @@ class SetupPage(QWidget):
     # ------------------------------------------------------------------
 
     def _build_zone_body(self, mode):
+        # LEFT: video-related work only (queue, camera/subjects) -- every
+        # tracking/zone/detection setting lives in the RIGHT column instead
+        # (MM asked for the left column kept clear for just the video).
         left_scroll, left = self._scroll_column(fixed_width=330)
         self._video_header_row(left)
+        left.addStretch()
+
+        right_scroll, right = self._scroll_column(fixed_width=340)
 
         time_box = QGroupBox("Time window & zone names")
         tv = QVBoxLayout(time_box)
@@ -791,19 +779,17 @@ class SetupPage(QWidget):
         tv.addWidget(QLabel("ROI names (comma-separated):"))
         self.roi_names_entry = QLineEdit(self.app._memory.get("roi_names_entry", ""))
         tv.addWidget(self.roi_names_entry)
-        tv.addWidget(_hint("Optional -- leave this blank and click 'Draw Zones' below instead: "
-                            "draw each zone's line/box/oval on the video and you'll be asked to "
-                            "name it right after, one at a time."))
+        tv.addWidget(_hint("Optional -- or click 'Draw Zones'/'Draw Zone Lines' below and name "
+                            "each zone as you draw it."))
         tv.addWidget(_hint("Object names (only used if Interaction Tracking is on):"))
         self.object_names_entry = QLineEdit(self.entry_or_default("object_names_entry", ""))
         tv.addWidget(self.object_names_entry)
-        tv.addWidget(_hint("Interaction margin around objects, px (0 = only counts when the "
-                            "tracked point is strictly inside the object's outline; raise this "
-                            "to also count approaching/sniffing from just outside it):"))
+        tv.addWidget(_hint("Interaction margin, px (0 = must be inside the object; raise to "
+                            "count nearby too):"))
         self.interaction_margin_entry = QLineEdit(self.entry_or_default("interaction_margin_entry", "20"))
         self.interaction_margin_entry.setFixedWidth(60)
         tv.addWidget(self.interaction_margin_entry)
-        left.addWidget(time_box)
+        right.addWidget(time_box)
 
         analysis_box = QGroupBox("Analysis")
         av = QVBoxLayout(analysis_box)
@@ -821,13 +807,9 @@ class SetupPage(QWidget):
         self.entries_var.setChecked(self.var_or_default("entries_var", False))
         entries_row.addWidget(self.entries_var)
         if mode == "standard":
-            # Explanation moved to a hover ⓘ (was a permanent paragraph
-            # under the checkboxes) -- still one hover away, not clutter.
             entries_row.addWidget(_info_icon(
-                "Standard Tracking also estimates nose/center/tail-base each frame (no extra "
-                "setup) and reports full/half/semi zone-entry depth (how much of the body "
-                "crossed in) in the exported CSV/Excel -- Arm Entries adds a stricter "
-                "whole-body '_full_entries' count alongside the usual one."))
+                "Counts each debounced crossing into a zone, based on the tracked "
+                "center point (see calculate_arm_entries)."))
         entries_row.addStretch()
         av.addLayout(entries_row)
         self.altern_var = QCheckBox("Arm Alternation")
@@ -838,16 +820,12 @@ class SetupPage(QWidget):
         self.all_var = QCheckBox("All Behaviours")
         self.all_var.setChecked(self.var_or_default("all_var", False))
         av.addWidget(self.all_var)
-        left.addWidget(analysis_box)
+        right.addWidget(analysis_box)
 
         if mode == "standard":
             stop_box = QGroupBox("Stop condition (optional)")
             sv = QVBoxLayout(stop_box)
-            sv.addWidget(_hint(
-                "Stop the run early, before the End (s) time above, when one of these is "
-                "reached -- inspired by EthoVision's Trial Control rules and SMART's Status "
-                "Rules. Leave on 'None' to just use End (s)."
-            ))
+            sv.addWidget(_hint("Stop early once this is reached. Leave 'None' to just use End (s)."))
             self.stop_condition_combo = QComboBox()
             self.stop_condition_combo.addItems([
                 "None", "N seconds of immobility", "N entries into a zone", "N pixels of total distance",
@@ -866,22 +844,31 @@ class SetupPage(QWidget):
             self.stop_zone_entry = QLineEdit(self.entry_or_default("stop_zone_entry", ""))
             row2.addWidget(self.stop_zone_entry)
             sv.addLayout(row2)
-            left.addWidget(stop_box)
+            right.addWidget(stop_box)
 
             zone_assoc_box = QGroupBox("Zone Associations (optional)")
             zav = QVBoxLayout(zone_assoc_box)
             zav.addWidget(_hint(
-                "Group 2+ of your zones into one named combined zone for reporting, without "
-                "redrawing anything (SMART's zone grouping). One or more 'Group = Zone + Zone' "
-                "definitions, separated by ';' -- e.g. 'Left Side = Left Arm + Left Corner' "
-                "reports time/percent/entries for 'Left Side' too, on top of its two real zones."
+                "Combine 2+ zones into one named zone for reporting -- "
+                "'Group = Zone + Zone', separated by ';'."
             ))
             self.zone_associations_entry = QLineEdit(self.entry_or_default("zone_associations_entry", ""))
             self.zone_associations_entry.setPlaceholderText(
                 "Left Side = Left Arm + Left Corner; Right Side = Right Arm + Right Corner"
             )
             zav.addWidget(self.zone_associations_entry)
-            left.addWidget(zone_assoc_box)
+            right.addWidget(zone_assoc_box)
+
+            zone_formula_box = QGroupBox("Zone Formula (optional)")
+            zfv = QVBoxLayout(zone_formula_box)
+            zfv.addWidget(_hint(
+                "For zones from 'Draw Zone Lines' (auto-detected partitions A, B, C, ...): "
+                "name them here -- 'A = Center', 'B+C = Left Arm', separated by ';'."
+            ))
+            self.zone_formula_entry = QLineEdit(self.entry_or_default("zone_formula_entry", ""))
+            self.zone_formula_entry.setPlaceholderText("A = Center; B+C = Left Arm")
+            zfv.addWidget(self.zone_formula_entry)
+            right.addWidget(zone_formula_box)
 
             smooth_box = QGroupBox("Trajectory smoothing (optional)")
             smv = QVBoxLayout(smooth_box)
@@ -889,10 +876,8 @@ class SetupPage(QWidget):
             self.smooth_trajectory_var.setChecked(self.var_or_default("smooth_trajectory_var", False))
             smv.addWidget(self.smooth_trajectory_var)
             smv.addWidget(_hint(
-                "Filters out single-frame detection noise (a momentary snap onto a shadow/"
-                "reflection) and evens out the rest, before drawing the Trajectory/Heatmap "
-                "charts -- mirrors SMART's Anti-Vibration/Anti-Artifact/LOWESS filters. "
-                "raw_tracking.csv still keeps the real, unfiltered positions too."
+                "Filters out single-frame noise before the Trajectory/Heatmap charts. "
+                "raw_tracking.csv still keeps the unfiltered positions too."
             ))
             srow = QHBoxLayout()
             srow.addWidget(QLabel("Window (frames):"))
@@ -901,17 +886,14 @@ class SetupPage(QWidget):
             srow.addWidget(self.smooth_window_entry)
             srow.addStretch()
             smv.addLayout(srow)
-            left.addWidget(smooth_box)
+            right.addWidget(smooth_box)
 
             custom_vars_box = QGroupBox("Custom Variables (optional)")
             cvv = QVBoxLayout(custom_vars_box)
             cvv.addWidget(_hint(
-                "Add your own derived column(s) to raw_tracking.csv/the exported Excel, "
-                "computed from the columns already tracked (mirrors EthoVision's custom "
-                "variables). One 'name = expression' per line -- a later line can use a name "
-                "defined just above it. Safely sandboxed: arithmetic, comparisons, and a few "
-                "math functions only (abs, round, min, max, sqrt, log, log10, exp, sin, cos, "
-                "tan, clip, where) -- no arbitrary code."
+                "Add derived column(s) computed from the tracked columns. One "
+                "'name = expression' per line; a later line can use a name from above it. "
+                "Arithmetic, comparisons and a few math functions only -- no arbitrary code."
             ))
             self.custom_variables_entry = QPlainTextEdit(self.app._memory.get("custom_variables_var", ""))
             self.custom_variables_entry.setPlaceholderText(
@@ -919,45 +901,9 @@ class SetupPage(QWidget):
             )
             self.custom_variables_entry.setFixedHeight(64)
             cvv.addWidget(self.custom_variables_entry)
-            left.addWidget(custom_vars_box)
+            right.addWidget(custom_vars_box)
 
-        # ---- Quick Setup: pick a known apparatus, then draw each of its
-        # zones by hand (Line/Rectangle/Ellipse/Freehand), with that
-        # apparatus's own zone names offered as suggestions right after
-        # each shape, in order (Center, Open Arm 1, ...) -- see
-        # MainWindow.quick_setup_template/_next_auto_zone_name. This is now
-        # the ONLY apparatus-template entry point: the old separate "Maze
-        # Template" dialog used to auto-generate a default-sized shape for
-        # each zone and have you drag its corners into alignment, but MM
-        # asked for that replaced everywhere with the same
-        # draw-it-yourself-then-name-it interaction "Draw Zones" already
-        # uses, since tracing the real photographed maze by hand lines up
-        # better than dragging an idealized default shape into place ever
-        # did -- so there's no separate dialog anymore, just these tiles.
-        quick_box = QGroupBox("Quick Setup (Apparatus Templates)")
-        qv = QVBoxLayout(quick_box)
-        qv.addWidget(_hint("Crop or set the arena above first, then pick your apparatus here -- "
-                            "you'll draw each zone yourself (Draw Zones' shape tools) and it'll "
-                            "suggest that apparatus's zone names as you go, one at a time."))
-        grid = QGridLayout()
-        tiles = [(k, MAZE_TEMPLATES[k]["label"]) for k in MAZE_TEMPLATES.keys()]
-        tiles.append((None, "Custom Arena"))
-        self.quick_setup_buttons = {}
-        for i, (key, label) in enumerate(tiles):
-            r, c = divmod(i, 2)
-            b = QPushButton(label)
-            b.setObjectName("toolBtn")
-            if key:
-                b.clicked.connect(lambda checked=False, k=key: self.app.quick_setup_template(k))
-            else:
-                b.clicked.connect(lambda checked=False: self.app.start_op("zones"))
-            grid.addWidget(b, r, c)
-            self.quick_setup_buttons[key] = b
-        qv.addLayout(grid)
-        left.addWidget(quick_box)
-
-        self._animals_row(left, mode)
-        left.addStretch()
+        self._animals_row(right, mode)
 
         # ---- CENTER: preview canvas + toolbar ----
         center = QVBoxLayout()
@@ -980,6 +926,14 @@ class SetupPage(QWidget):
             ("crop", "Crop Arena", lambda: self.app.start_op("crop")),
             ("mask", "Mask Zone", lambda: self.app.start_op("mask")),
             ("zones", "Draw Zones", lambda: self.app.start_op("zones")),
+        ]
+        if mode == "standard":
+            # Line-based Zone Drawing: trace the apparatus's own dividers as
+            # lines, and the app auto-detects/letters the enclosed
+            # partitions (A, B, C, ...) -- named afterward in the Zone
+            # Formula box above (e.g. "A = Center", "B+C = Left Arm").
+            tools.append(("zone_lines", "Draw Zone Lines", lambda: self.app.start_op("zone_lines")))
+        tools += [
             ("objects", "Mark Objects", lambda: self.app.start_op("objects")),
             ("distance", "Calibrate Distance", lambda: self.app.start_op("distance")),
             ("nocrop", "No Crop", self.app.on_tool_no_crop),
@@ -1008,8 +962,8 @@ class SetupPage(QWidget):
         self.canvas = PreviewCanvas(self.app)
         center.addWidget(self.canvas, 1)
 
-        # ---- RIGHT: detection settings ----
-        right_scroll, right = self._scroll_column(fixed_width=320)
+        # ---- RIGHT (continued): Detection Settings, at the bottom of the
+        # same settings column everything else above was added to ----
         right_hdr = QHBoxLayout()
         right_hdr.addWidget(QLabel("Detection Settings"))
         right_hdr.addStretch()
