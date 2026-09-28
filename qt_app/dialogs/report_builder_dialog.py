@@ -30,9 +30,8 @@ def open_report_builder_dialog(parent, full_df, id_columns, output_dir):
     layout = QVBoxLayout(dialog)
 
     intro = QLabel(
-        "Pick which computed stats go in this report -- everything is checked by "
-        "default (today's full sheet). Saving writes Custom_Report.csv/.xlsx to the "
-        "results folder with just the columns you keep checked."
+        "Pick which stats to include (all checked by default). Saves as "
+        "Custom_Report.csv/.xlsx in the results folder."
     )
     intro.setWordWrap(True)
     intro.setStyleSheet("color: #666666; font-size: 9px;")

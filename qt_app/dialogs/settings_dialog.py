@@ -28,17 +28,13 @@ NUMERIC_FIELDS = [
     ("Min mouse area, px", "min_area_entry", "15"),
     ("Max object area, px", "max_area_entry", "5000"),
     ("Max movement / frame, px", "max_jump_entry", "100"),
-    ("Prior-position window size, px", "window_size_entry", "120"),
-    ("Prior-position window weight (0-1)", "window_weight_entry", "0.5"),
     ("Default real-world distance", "real_distance_entry", "30"),
     ("Default units (e.g. cm, mm, in)", "units_entry", "cm"),
     ("Preview frames to save/check", "preview_samples_entry", "6"),
     ("Default time bin size, seconds (blank = 60)", "bin_size_entry", ""),
 ]
 CHECK_FIELDS = [
-    ("Prior-position weighting (on by default)", "use_window_var"),
     ("Per-zone adaptive threshold (on by default)", "use_zone_threshold_var"),
-    ("Reject shadows (on by default)", "reject_shadows_var"),
 ]
 COLOR_MODES = [("auto", "Auto (recommended)"), ("gray", "Grayscale (faster)"), ("rgb", "RGB / Color")]
 
@@ -53,9 +49,7 @@ def open_settings_dialog(app, parent):
     layout = QVBoxLayout(dialog)
 
     intro = QLabel(
-        "These are the STARTING defaults every new session's Detection Settings panel opens "
-        "with (Standard/Multi-Mouse/Behavior all share them). Changing a value already on "
-        "screen elsewhere in the app isn't affected until its page is rebuilt.\n\n"
+        "Starting defaults for every new session's Detection Settings.\n\n"
         f"Saved to: {SETTINGS_PATH}"
     )
     intro.setWordWrap(True)
