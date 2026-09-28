@@ -18,8 +18,6 @@ from analysis.calculations import point_distance, safe_col
 from analysis.custom_variables import apply_custom_variables
 from tracking.interaction import extract_bouts
 from tracking.epm import calculate_arm_entries, calculate_alternation
-from tracking.two_mouse import MotionHistory, _motion_overlap_fraction
-from tracking.behavior import _pose_from_points
 from output.csv import write_csv_report
 from output.excel import write_excel_report
 
@@ -186,51 +184,98 @@ def linearize_roi(membership, null_name="None"):
     return "_".join(active) if active else null_name
 
 
-def _in_mask(mask, x, y):
-    """True if point (x, y) falls inside this single boolean ROI mask."""
-    if mask is None or x is None or y is None or (isinstance(x, float) and math.isnan(x)):
-        return False
-    xi, yi = int(round(x)), int(round(y))
-    h, w = mask.shape
-    return bool(0 <= yi < h and 0 <= xi < w and mask[yi, xi])
+# -----------------------------
+# Line-based zone drawing (auto-detected partitions)
+# -----------------------------
 
 
-def classify_entry_type(nose_in, center_in, tail_in):
-    """Standard EPM/Y-maze/T-maze-style entry classification, based on HOW
-    MANY of the animal's 3 tracked points -- nose, body center, tail base
-    -- have crossed into a zone, not just whether its centroid has:
-
-      - "full": all 3 points inside -- the whole animal has committed to
-        the zone (the strict, publication-standard definition of an
-        "arm entry").
-      - "half": 2 of the 3 points inside -- typically nose+center while
-        the tail still trails outside during an entry (head and
-        shoulders committed, body not fully in yet), or center+tail
-        while the nose has already left during an exit.
-      - "semi": exactly 1 of the 3 points inside -- typically just the
-        nose during an entry (an exploratory head dip / stretch-attend
-        approach without committing the body), or just the tail
-        trailing behind during an exit.
-      - "none": no part of the tracked animal is in this zone.
-
-    Deliberately count-based (not "must include the nose") so entering
-    nose-first and leaving tail-last both progress through the same
-    none -> semi -> half -> full -> half -> semi -> none staircase
-    symmetrically, rather than only being meaningful for entries."""
-    count = int(bool(nose_in)) + int(bool(center_in)) + int(bool(tail_in))
-    return {3: "full", 2: "half", 1: "semi"}.get(count, "none")
+def _partition_letter(index):
+    """0->A, 1->B, ..., 25->Z, 26->AA, 27->AB, ... (spreadsheet-column
+    style), so an apparatus with more than 26 partitions still gets
+    distinct, orderly labels instead of running out of letters."""
+    index += 1
+    letters = ""
+    while index > 0:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
 
 
-def entry_zone_membership(roi_names, entry_types, level):
-    """Given this frame's {zone_name: entry_type} classification, return a
-    {zone_name: bool} membership dict for a given strictness level -- "any"
-    (semi or better, i.e. the old nose-only-or-more definition), "half"
-    (half or better) or "full" (the strict whole-body definition). Mirrors
-    roi_membership()'s output shape so it plugs straight into
-    linearize_roi()."""
-    order = {"none": 0, "any": 1, "semi": 1, "half": 2, "full": 3}
-    min_level = order.get(level, 3)
-    return {name: order.get(entry_types.get(name, "none"), 0) >= min_level for name in roi_names}
+def detect_zone_partitions(line_strokes, width, height, min_area_fraction=0.01, line_thickness=3):
+    """The "draw lines, not shapes" Zone Drawing workflow: the user traces
+    the apparatus's own internal walls/dividers as open line strokes (each
+    a list of (x, y) points) instead of tracing each zone's outline by
+    hand. The arena's own rectangular border acts as the outer wall
+    already enclosing everything, so the drawn lines only need to cover
+    the INTERNAL dividers, not retrace the frame edge.
+
+    Rasterizes those lines plus the arena border onto one mask, then finds
+    every enclosed open region (cv2.connectedComponentsWithStats on the
+    inverse of that mask) -- each one is a "partition". Partitions are
+    auto-labeled A, B, C, ... in reading order (top-to-bottom, then
+    left-to-right within a row of roughly-level partitions), and returned
+    as {letter: [(x, y), ...]} -- a simplified polygon outline for each
+    one, in exactly the same shape build_roi_masks()/roi_membership()
+    already expect from a hand-drawn zone, so a detected partition plugs
+    straight into the existing tracking/reporting pipeline unchanged.
+
+    Returns ({}, "<message>") if no strokes divide the arena into more
+    than one region, or every region found is smaller than
+    min_area_fraction of the arena (stray clicks/noise)."""
+    walls = np.zeros((height, width), dtype=np.uint8)
+    cv2.rectangle(walls, (0, 0), (width - 1, height - 1), 255, line_thickness)
+    for stroke in line_strokes:
+        if len(stroke) < 2:
+            continue
+        pts = np.array(stroke, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(walls, [pts], False, 255, line_thickness)
+
+    open_space = cv2.bitwise_not(walls)
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(open_space, connectivity=4)
+
+    min_area = min_area_fraction * width * height
+    found = []  # (cy, cx, polygon points)
+    for label in range(1, n_labels):  # label 0 is the wall/background pixels
+        if stats[label, cv2.CC_STAT_AREA] < min_area:
+            continue
+        region_mask = (labels == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        epsilon = 0.01 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
+        if len(pts) < 3:
+            continue
+        cx, cy = centroids[label]
+        found.append((float(cy), float(cx), pts))
+
+    if not found:
+        return {}, ("No enclosed zones were found -- the lines need to fully divide the arena "
+                     "(reaching the frame edge or each other, with no gaps) into 2 or more parts.")
+
+    # Reading order: top-to-bottom, then left-to-right -- bucket into
+    # "rows" of roughly-level partitions first (within row_tol of each
+    # other) so e.g. two side-by-side arms read left-then-right before
+    # dropping to the next row, rather than being ordered by exact pixel
+    # y (which would interleave rows on the slightest camera tilt).
+    found.sort(key=lambda p: p[0])
+    row_tol = max(20.0, height * 0.08)
+    rows = []
+    for cy, cx, pts in found:
+        placed_row = next((r for r in rows if abs(r[0] - cy) <= row_tol), None)
+        if placed_row is None:
+            rows.append([cy, [(cy, cx, pts)]])
+        else:
+            placed_row[1].append((cy, cx, pts))
+
+    ordered = []
+    for _row_cy, items in rows:
+        items.sort(key=lambda p: p[1])
+        ordered.extend(items)
+
+    return {_partition_letter(i): pts for i, (_cy, _cx, pts) in enumerate(ordered)}, None
 
 
 def draw_roi_polygons(display, roi_points):
@@ -448,40 +493,19 @@ def make_background(cap, start_frame, end_frame, matrix, warp_w, warp_h, sample_
 # -----------------------------
 
 
-def _shadow_mask(current_bgr, background_bgr, v_ratio_range=(0.25, 0.92), hue_tol=25, sat_tol=60):
-    """True where a pixel looks like a SHADOW rather than a genuine change:
-    similar hue and saturation to the background at that spot, but
-    consistently darker (lower brightness/V) within the ratio range real
-    shadows typically fall in. This is the same hue/saturation/value-ratio
-    idea OpenCV's own MOG2 background subtractor uses for shadow detection
-    -- a shadow darkens the existing surface without changing its color,
-    while a genuine animal usually differs in hue/saturation too, or is
-    darkened well outside a shadow's typical ratio."""
-    cur_hsv = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-    bg_hsv = cv2.cvtColor(background_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-
-    v_bg = bg_hsv[..., 2]
-    v_cur = cur_hsv[..., 2]
-    v_ratio = np.divide(v_cur, v_bg, out=np.ones_like(v_cur), where=v_bg > 5)
-
-    hue_diff = np.abs(cur_hsv[..., 0] - bg_hsv[..., 0])
-    hue_diff = np.minimum(hue_diff, 180 - hue_diff)  # hue wraps at 180 in OpenCV's 0-179 range
-
-    sat_diff = np.abs(cur_hsv[..., 1] - bg_hsv[..., 1])
-
-    return (
-        (v_ratio >= v_ratio_range[0]) & (v_ratio <= v_ratio_range[1])
-        & (hue_diff <= hue_tol) & (sat_diff <= sat_tol)
-    )
-
-
 def detect_mouse(
     frame, background, arena, previous_point, previous_area,
     threshold, min_area, max_area, max_jump,
-    roi_masks=None, use_window=False, window_size=120, window_weight=0.5,
-    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False,
-    motion_mask=None, debris_motion_fraction=0.02, debris_still_radius_px=20
+    roi_masks=None, exclusion_mask=None, color_mode="gray"
 ):
+    """Core per-frame detection: background-diff -> threshold (global, or
+    per-zone adaptive Otsu when roi_masks is given) -> morphological
+    clean-up -> contour candidates -> best-candidate scoring. Deliberately
+    kept to this proven, minimal pipeline (matching the light-dark box
+    tracker this was benchmarked against) -- no prior-position weighting,
+    shadow rejection, or motion-history debris filtering, all of which
+    turned out to cause more localized tracking loss (e.g. a dark-zone/
+    dark-furred mouse getting misread as a shadow) than they prevented."""
     x1, y1, x2, y2 = arena
 
     if color_mode == "rgb":
@@ -506,28 +530,7 @@ def detect_mouse(
         # same technique ezTrack uses (dif[mask] = 0).
         diff[exclusion_mask[y1:y2, x1:x2]] = 0
 
-    if use_window and previous_point is not None:
-        px = previous_point[0] - x1
-        py = previous_point[1] - y1
-        half = max(1.0, window_size / 2.0)
-
-        weights = np.full(diff.shape, max(0.0, 1.0 - window_weight), dtype=np.float32)
-
-        wy1 = max(0, int(py - half))
-        wy2 = min(diff.shape[0], int(py + half))
-        wx1 = max(0, int(px - half))
-        wx2 = min(diff.shape[1], int(px + half))
-
-        if wy2 > wy1 and wx2 > wx1:
-            weights[wy1:wy2, wx1:wx2] = 1.0
-
-        diff = diff * weights
-
     diff_u8 = np.clip(diff, 0, 255).astype(np.uint8)
-
-    if reject_shadows and color_background is not None:
-        shadow = _shadow_mask(frame[y1:y2, x1:x2], color_background[y1:y2, x1:x2])
-        diff_u8[shadow] = 0
 
     if roi_masks:
         mask = np.zeros(diff_u8.shape, dtype=np.uint8)
@@ -603,49 +606,6 @@ def detect_mouse(
     if not candidates:
         return None, mask
 
-    # Reject candidates that never show real recent pixel motion -- e.g. a
-    # patch of stationary "background" that a slow-moving/revisited animal
-    # has inadvertently absorbed into the median background model (see
-    # MotionHistory/reject_static_debris in tracking.two_mouse for the full
-    # explanation). Without this, an animal that repeatedly returns to the
-    # same spot -- routine in an EPM/Y-maze/T-maze, where the center hub is
-    # revisited between every arm entry -- can end up with a permanent
-    # phantom "blob" at that spot once background absorption kicks in,
-    # which then wins every distance-based candidate comparison simply for
-    # being close to wherever tracking last was.
-    if motion_mask is not None and candidates:
-        crop = motion_mask[y1:y2, x1:x2]
-        alive = [c for c in candidates
-                 if _motion_overlap_fraction(c["contour"], mask.shape, crop) >= debris_motion_fraction]
-
-        if alive:
-            candidates = alive
-        elif len(candidates) == 1 and previous_point is not None:
-            # Only one candidate this frame, and it shows no real recent
-            # motion. The guard this used to have (only filter when there's
-            # MORE than one candidate) exists so a genuine lone detection
-            # is never turned into "nothing found" -- a real animal holding
-            # still (freezing/grooming) shows no frame-to-frame motion
-            # either, and that must keep tracking uninterrupted.
-            #
-            # But a motionless singleton that shows up somewhere NEW is a
-            # different case: a real animal disturbs the scene as it moves
-            # into a spot, so a static blob with no motion at all anywhere
-            # in the recent window is far more likely a fixed environmental
-            # fixture (a label taped to the maze wall, a screw, a seam)
-            # that diff-vs-background happened to catch -- and once this
-            # function's own distance-based candidate scoring below latches
-            # onto one, it's self-reinforcing forever after: sitting still,
-            # its own distance-to-previous is 0 every single frame, which
-            # beats any real, moving, non-zero-distance candidate on score
-            # even after the real animal wanders back within max_jump of
-            # it. So: keep a motionless singleton close to where tracking
-            # already was (very likely the SAME animal simply holding
-            # still), but drop one that appeared far from it instead of
-            # trusting it as a freshly-found detection.
-            if point_distance(candidates[0]["center"], previous_point) > debris_still_radius_px:
-                candidates = []
-
     best = None
     best_score = float("inf")
 
@@ -685,8 +645,7 @@ def detect_mouse(
 
 
 def local_recovery(frame, background, previous_point, arena, threshold, min_area, max_area,
-                    exclusion_mask=None, color_mode="gray", color_background=None, reject_shadows=False,
-                    motion_mask=None, debris_motion_fraction=0.02):
+                    exclusion_mask=None, color_mode="gray"):
     if previous_point is None:
         return None
 
@@ -713,25 +672,8 @@ def local_recovery(frame, background, previous_point, arena, threshold, min_area
     if exclusion_mask is not None:
         diff[exclusion_mask[y1:y2, x1:x2]] = 0
 
-    if reject_shadows and color_background is not None:
-        shadow = _shadow_mask(frame[y1:y2, x1:x2], color_background[y1:y2, x1:x2])
-        diff[shadow] = 0
-
     _, mask = cv2.threshold(diff, int(threshold), 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Same absorbed-background safety net as detect_mouse() -- recovery
-    # searches a purely distance-based window around previous_point, which
-    # is exactly what a phantom static blob would otherwise win by default
-    # (it IS previous_point, or very near it). Only filters when it doesn't
-    # empty out the candidate pool, so a real recovery of a genuinely still
-    # animal is never blocked.
-    if motion_mask is not None and len(contours) > 1:
-        motion_crop = motion_mask[y1:y2, x1:x2]
-        alive = [c for c in contours
-                 if _motion_overlap_fraction(c, mask.shape, motion_crop) >= debris_motion_fraction]
-        if alive:
-            contours = alive
 
     best = None
     best_d = float("inf")
@@ -767,8 +709,8 @@ def local_recovery(frame, background, previous_point, arena, threshold, min_area
 def calculate_transitions(df, confirmation_frames=3, roi_col="ROI"):
     """Turn a per-frame zone-label column into a From/To transitions table.
     roi_col defaults to "ROI" (the centroid-based zone label) but can be
-    pointed at any other linearize_roi()-style column -- e.g. "Full_Entry_ROI"
-    -- to get transitions/entries under a stricter definition of "entered"."""
+    pointed at any other linearize_roi()-style column -- e.g. a Zone
+    Associations group label -- for a different zone grouping."""
     valid = df[df["Tracking_Status"] == "Tracked"]
     columns = ["From_ROI", "To_ROI", "Transition_seconds"]
 
@@ -812,8 +754,7 @@ def run_detection_preview(
     cap, matrix, warp_w, warp_h, start_frame, end_frame,
     background, arena, roi_masks, roi_points, object_points,
     threshold, min_area, max_area, n_samples, output_dir, show_live=True,
-    mask_polygons=None, exclusion_mask=None, color_mode="gray",
-    color_background=None, reject_shadows=False
+    mask_polygons=None, exclusion_mask=None, color_mode="gray"
 ):
     preview_dir = os.path.join(output_dir, "preview")
     os.makedirs(preview_dir, exist_ok=True)
@@ -837,8 +778,7 @@ def run_detection_preview(
         candidate, _ = detect_mouse(
             frame, background, arena, None, None,
             threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1),
-            float("inf"), roi_masks=roi_masks, exclusion_mask=exclusion_mask, color_mode=color_mode,
-            color_background=color_background, reject_shadows=reject_shadows
+            float("inf"), roi_masks=roi_masks, exclusion_mask=exclusion_mask, color_mode=color_mode
         )
 
         disp = frame.copy()
@@ -1037,9 +977,6 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
     min_area = setup["min_area"]
     max_area = setup["max_area"]
     max_jump = setup["max_jump"]
-    use_window = setup["use_window"]
-    window_size = setup["window_size"]
-    window_weight = setup["window_weight"]
 
     # Optional early-stop rule -- inspired by EthoVision's Trial Control
     # rules and SMART's Status Rules, but simplified to the three cases
@@ -1057,22 +994,11 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         output_dir = compute_output_dir(video_path)
 
     color_mode = setup.get("color_mode", "gray")
-    reject_shadows = setup.get("reject_shadows", False)
 
     background = make_background(
         cap, start_frame, end_frame, matrix, warp_w, warp_h, setup["background_samples"],
         color_mode=color_mode
     )
-
-    # Shadow rejection needs a COLOR reference regardless of color_mode --
-    # only build the extra background model when the feature is actually
-    # turned on, since it's otherwise wasted work.
-    color_background = background if color_mode == "rgb" else None
-    if reject_shadows and color_background is None:
-        color_background = make_background(
-            cap, start_frame, end_frame, matrix, warp_w, warp_h, setup["background_samples"],
-            color_mode="rgb"
-        )
 
     if show_display:
         cv2.imshow("Automatic background - press ENTER", background)
@@ -1090,8 +1016,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         cap, matrix, warp_w, warp_h, start_frame, end_frame,
         background, arena, detection_roi_masks, roi_points, object_points,
         threshold, min_area, max_area, setup["preview_samples"], output_dir, show_live=show_display,
-        mask_polygons=mask_polygons, exclusion_mask=exclusion_mask, color_mode=color_mode,
-        color_background=color_background, reject_shadows=reject_shadows
+        mask_polygons=mask_polygons, exclusion_mask=exclusion_mask, color_mode=color_mode
     )
 
     # -----------------------------------------
@@ -1107,30 +1032,6 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
     max_recovery_streak = 10
     recovery_streak = 0
-
-    # See detect_mouse()'s own comment for the full rationale: without this,
-    # an animal that repeatedly revisits the same spot -- the norm in an
-    # EPM/Y-maze/T-maze, where the center hub is crossed between every arm
-    # entry -- can have that spot's median background absorb it, producing a
-    # phantom "blob" there that silently hijacks tracking. Window/threshold
-    # values match tracking.two_mouse.DEFAULTS so behavior is consistent
-    # between the two tracking pipelines.
-    debris_motion_window_s = 1.2
-    debris_motion_pixel_threshold = 12
-    debris_motion_fraction = 0.02
-    motion_history = MotionHistory(
-        max(1, fps * debris_motion_window_s), pixel_threshold=debris_motion_pixel_threshold
-    )
-
-    # 3-point pose (nose / body center / tail base), re-estimated fresh each
-    # tracked frame from the winning candidate's own contour via the same
-    # classical PCA-based pseudo-pose approach as tracking.behavior (no
-    # deep learning/training data) -- see _pose_from_points there for the
-    # full explanation. prev_pose is only used so the nose-vs-tail-end
-    # disambiguation stays consistent frame to frame (an animal's nose
-    # doesn't teleport to where its tail was); a lost/untracked frame
-    # simply produces no pose (NaN columns) rather than inventing one.
-    prev_pose = None
 
     # Bookkeeping for the optional early-stop rule (see stop_condition
     # above) -- only the branch that matches stop_condition is ever
@@ -1157,17 +1058,10 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         frame = cv2.warpPerspective(raw_frame, matrix, (warp_w, warp_h))
         current_time = frame_number / fps
 
-        gray_for_motion = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        motion_history.update(gray_for_motion)
-
         candidate, mask = detect_mouse(
             frame, background, arena, previous_point, previous_area,
             threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1), max_jump,
-            roi_masks=detection_roi_masks, use_window=use_window,
-            window_size=window_size, window_weight=window_weight,
-            exclusion_mask=exclusion_mask, color_mode=color_mode,
-            color_background=color_background, reject_shadows=reject_shadows,
-            motion_mask=motion_history.mask, debris_motion_fraction=debris_motion_fraction
+            roi_masks=detection_roi_masks, exclusion_mask=exclusion_mask, color_mode=color_mode
         )
 
         used_recovery = False
@@ -1176,9 +1070,7 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             candidate = local_recovery(
                 frame, background, previous_point, arena,
                 threshold, max(1, int(min_area)), max(int(max_area), int(min_area) + 1),
-                exclusion_mask=exclusion_mask, color_mode=color_mode,
-                color_background=color_background, reject_shadows=reject_shadows,
-                motion_mask=motion_history.mask, debris_motion_fraction=debris_motion_fraction
+                exclusion_mask=exclusion_mask, color_mode=color_mode
             )
             used_recovery = candidate is not None
 
@@ -1202,9 +1094,6 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         velocity = 0.0
         zone_membership = {name: False for name in roi_names}
         object_membership = {name: False for name in object_names}
-        nose_xy = (np.nan, np.nan)
-        tail_xy = (np.nan, np.nan)
-        entry_types = {name: "none" for name in roi_names}
 
         if candidate is not None:
             x, y = candidate["center"]
@@ -1227,36 +1116,9 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             if object_masks:
                 object_membership = roi_membership(object_masks, x, y)
             status = "Tracked"
-
-            # 3-point pose -- see the note above the loop. Only possible
-            # when the winning candidate carries its own contour (the
-            # normal detect_mouse() path does; local_recovery()'s coarse
-            # fallback doesn't, so a recovery frame simply has no pose).
-            contour = candidate.get("contour")
-            if contour is not None and area and area > 0:
-                pts = contour.reshape(-1, 2).astype(np.float64)
-                pose = _pose_from_points(
-                    pts, (x, y), frame_number, current_time, prev_pose,
-                    max_jump, base_conf=1.0, split=False
-                )
-                if pose is not None:
-                    prev_pose = pose
-                    nose_xy = pose.xy("nose") or (np.nan, np.nan)
-                    tail_xy = pose.xy("tail_base") or (np.nan, np.nan)
-                    if roi_names:
-                        for name in roi_names:
-                            zmask = roi_masks.get(name)
-                            entry_types[name] = classify_entry_type(
-                                _in_mask(zmask, *nose_xy),
-                                _in_mask(zmask, x, y),
-                                _in_mask(zmask, *tail_xy),
-                            )
         else:
             roi_label = "None"
             status = "Lost"
-
-        full_entry_membership = entry_zone_membership(roi_names, entry_types, "full")
-        full_entry_label = linearize_roi(full_entry_membership)
 
         row = {
             "Frame": frame_number,
@@ -1265,11 +1127,6 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             "Mouse_Y": y,
             "Mouse_Present": status == "Tracked",
             "ROI": roi_label,
-            "Nose_X": nose_xy[0],
-            "Nose_Y": nose_xy[1],
-            "TailBase_X": tail_xy[0],
-            "TailBase_Y": tail_xy[1],
-            "Full_Entry_ROI": full_entry_label,
             "Detected_area": area,
             "Distance_pixels": distance_px,
             "Velocity_pixels_s": velocity,
@@ -1278,7 +1135,6 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
         for name in roi_names:
             row[f"In_{safe_col(name)}"] = zone_membership.get(name, False)
-            row[f"Entry_{safe_col(name)}"] = entry_types.get(name, "none")
         for name in object_names:
             row[f"Near_{safe_col(name)}"] = object_membership.get(name, False)
 
@@ -1335,24 +1191,14 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
             if status == "Tracked":
                 draw_crosshair(display, (int(x), int(y)), size=9, color=(0, 0, 255), thickness=2)
-                # 3-point pose overlay -- nose (green) / tail base (blue),
-                # each a distinct color from the body-center crosshair
-                # (red) above, so all three are visible at a glance.
-                if not math.isnan(nose_xy[0]):
-                    draw_crosshair(display, (int(nose_xy[0]), int(nose_xy[1])), size=6, color=(0, 220, 0), thickness=2)
-                if not math.isnan(tail_xy[0]):
-                    draw_crosshair(display, (int(tail_xy[0]), int(tail_xy[1])), size=6, color=(255, 128, 0), thickness=2)
                 cv2.putText(
                     display, "AUTO TRACK", (max(5, int(x) - 50), max(20, int(y) - 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1
                 )
                 near_list = [n for n, v in object_membership.items() if v]
-                entry_list = [f"{n}:{t}" for n, t in entry_types.items() if t != "none"]
                 segments = ["ROI: " + roi_label]
                 if near_list:
                     segments.append("Near: " + ", ".join(near_list))
-                if entry_list:
-                    segments.append("Entry: " + ", ".join(entry_list))
 
                 # Wrapped instead of one fixed cv2.putText call -- on a
                 # narrower video (EPM/Y-maze/T-maze clips are often
@@ -1434,16 +1280,6 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
         summary[f"{safe_col(name)}_time_s"] = name_time
         summary[f"{safe_col(name)}_percent"] = (name_time / tracked_time * 100) if tracked_time > 0 else 0
 
-        # 3-point entry-depth breakdown for this zone -- how long the
-        # animal's nose/center/tail collectively qualified as each entry
-        # level (see classify_entry_type). "full" time is always <= the
-        # centroid-based In_<zone> time above, since it's the strictest.
-        entry_col = f"Entry_{safe_col(name)}"
-        if entry_col in tracked:
-            for level in ("full", "half", "semi"):
-                level_time = (tracked[entry_col] == level).sum() / fps
-                summary[f"{safe_col(name)}_{level}_time_s"] = level_time
-
     # Zone Associations -- fold each named group's member zones into one
     # OR-combined "zone" for reporting: In_<Group> is true whenever the
     # animal is in ANY member zone, then time/percent are computed exactly
@@ -1489,26 +1325,12 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
 
     summary["Total_transitions"] = len(transitions)
 
-    # Stricter, whole-body version of the same transitions table, built
-    # from Full_Entry_ROI (all 3 points -- nose/center/tail -- inside the
-    # zone) instead of ROI (centroid only). This is the standard
-    # publication definition of an EPM/Y-maze/T-maze "arm entry"; the
-    # centroid-based version above tends to fire slightly earlier/looser
-    # since only one point has to cross the boundary.
-    full_transitions = calculate_transitions(df, roi_col="Full_Entry_ROI") if any(
-        f"Entry_{safe_col(n)}" in df.columns for n in roi_names
-    ) else pd.DataFrame(columns=["From_ROI", "To_ROI", "Transition_seconds"])
-
     if setup.get("compute_arm_entries"):
         for name, count in calculate_arm_entries(transitions, roi_names).items():
             summary[f"{safe_col(name)}_entries"] = count
-        for name, count in calculate_arm_entries(full_transitions, roi_names).items():
-            summary[f"{safe_col(name)}_full_entries"] = count
 
     if setup.get("compute_alternation"):
         summary.update(calculate_alternation(transitions))
-        full_alt = calculate_alternation(full_transitions)
-        summary.update({f"Full_{k}": v for k, v in full_alt.items()})
 
     # -----------------------------------------
     # Interaction bouts
