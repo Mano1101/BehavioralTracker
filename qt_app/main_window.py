@@ -48,6 +48,36 @@ STOP_CONDITION_CODES = {
 }
 
 
+def parse_partition_formula(text):
+    """Setup page's Zone Formula box (Draw Zone Lines' auto-detected A/B/C/
+    ... partitions): "A = Center; B+C = Left Arm" -> ({"Center": ["A"],
+    "Left Arm": ["B", "C"]}, None), or ({}, "<message>") for the first
+    malformed piece found. Blank text is valid (no renaming applied -- the
+    raw letters are used as-is). Same shape/style as parse_zone_associations
+    just above, except a single member ('A = Center') is allowed here,
+    since naming ONE partition is the common case, not just merging
+    several."""
+    text = text.strip()
+    if not text:
+        return {}, None
+    groups = {}
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            return {}, f"'{chunk}' is missing '=' -- expected 'A = Zone Name' or 'A+B = Zone Name'."
+        name, members_raw = chunk.split("=", 1)
+        name = name.strip()
+        members = [m.strip() for m in members_raw.split("+") if m.strip()]
+        if not name:
+            return {}, f"A zone formula entry is missing its name in '{chunk}'."
+        if not members:
+            return {}, f"'{name}' needs at least one partition letter (e.g. 'A')."
+        groups[name] = members
+    return groups, None
+
+
 def parse_zone_associations(text):
     """Setup page's Zone Associations box: "Group = Zone A + Zone B; Group2
     = Zone C + Zone D" -> ({"Group": ["Zone A", "Zone B"], ...}, None), or
@@ -78,7 +108,7 @@ def parse_zone_associations(text):
 from tracking.location import (
     identity_transform, compute_perspective_transform, process_single_video,
     compute_output_dir, compute_zone_interaction_stats,
-    make_background, read_and_warp,
+    make_background, read_and_warp, detect_zone_partitions,
 )
 from tracking.two_mouse import (
     track_video, save_preview_frames as save_preview_frames_multi_mouse, choose_color_mode,
@@ -88,7 +118,6 @@ from tracking.behavior import (
     extract_features, classify_behaviors, save_preview_frames as save_preview_frames_behavior,
     calculate_behavior_time_bins,
 )
-from tracking.maze_templates import TEMPLATES as MAZE_TEMPLATES
 from analysis.calculations import point_distance
 from qt_app.widgets.preview_canvas import draw_overlays
 
@@ -131,6 +160,11 @@ class MainWindow(QMainWindow):
         self.pending_roi_points = {}
         self.pending_object_points = {}
         self.pending_mask_points = []
+        # Raw wall/divider line strokes from the "Draw Zone Lines" tool
+        # (see start_op/finish_op's "zone_lines" kind) -- kept around so
+        # reopening the tool starts from what was last drawn, same as
+        # pending_mask_points does for Mask Zone.
+        self.pending_zone_lines = []
         self.pending_scale_factor = None
         self.pending_scale_unit = None
 
@@ -683,46 +717,19 @@ class MainWindow(QMainWindow):
         self.pending_roi_points = {}
         self.pending_object_points = {}
         self.pending_mask_points = []
+        self.pending_zone_lines = []
         self.setup_page.refresh_canvas()
 
-    def quick_setup_template(self, key):
-        """A 'Quick Setup' apparatus tile (Elevated Plus Maze, Y-Maze, ...).
-        Needs the arena already set (Crop Arena or No Crop).
-
-        Used to auto-generate a default-sized shape for every one of the
-        template's zones and hand off to a drag-the-corners-to-align op
-        (start_template_zone_op) -- MM asked for that replaced everywhere
-        with the SAME draw-it-yourself-then-name-it interaction 'Draw
-        Zones' uses: an idealized default shape rarely lines up with the
-        real photographed maze's exact size/rotation/skew as well as
-        tracing it by hand does, and dragging 4+ corners per zone to fix
-        that was fiddly. So this now just starts a normal 'zones' op
-        (start_op, same as clicking 'Draw Zones'), tagged with this
-        template so the per-zone naming prompt suggests its zone names, in
-        order, as each shape is drawn (see _next_auto_zone_name) -- pick
-        the shape tool that fits (Line/Arm for a maze arm, Rectangle for a
-        chamber, ...), draw each zone over the real maze, confirm or
-        rename its suggested name, repeat."""
-        if self.pending_matrix is None:
-            QMessageBox.critical(self, "Arena needed", "Use 'Crop Arena' or 'No Crop' first.")
-            return
-        self.start_op("zones", template_key=key)
-
     # ------------------------------------------------------------------
-    # Embedded operations: Crop / Mask / Zones / Objects / Distance
-    # (mirrors TrackerApp._start_op/_cancel_op/_finish_op and the canvas
-    # mouse-event handlers in gui/main_window.py). The _op dict's points
-    # are always stored in FRAME-pixel space (the same space as
+    # Embedded operations: Crop / Mask / Zones / Zone Lines / Objects /
+    # Distance (mirrors TrackerApp._start_op/_cancel_op/_finish_op and the
+    # canvas mouse-event handlers in gui/main_window.py). The _op dict's
+    # points are always stored in FRAME-pixel space (the same space as
     # pending_roi_points etc.) -- PreviewCanvas converts widget clicks to
     # frame coordinates before calling on_canvas_press/drag/release.
     # ------------------------------------------------------------------
 
-    def start_op(self, kind, template_key=None):
-        """template_key: set only by quick_setup_template (an apparatus
-        tile in 'Quick Setup') -- tags the op so the per-zone naming
-        prompt suggests that apparatus's own zone names, in order, as
-        each shape is drawn (see _next_auto_zone_name/prompt_zone_label).
-        Plain 'Draw Zones' leaves this None, same as before."""
+    def start_op(self, kind):
         if kind == "crop":
             base_frame = self.get_active_raw_frame()
             if base_frame is None:
@@ -754,12 +761,14 @@ class MainWindow(QMainWindow):
 
         self.set_active_tool(kind)
 
-        op = {"kind": kind, "drag": None, "_base_frame": base_frame, "template_key": template_key}
+        op = {"kind": kind, "drag": None, "_base_frame": base_frame}
         if kind == "crop":
             saved = self.pending_crop_corners
             op["shapes"] = [list(saved)] if saved and len(saved) == 4 else [[]]
         elif kind == "mask":
             op["shapes"] = [list(p) for p in self.pending_mask_points] if self.pending_mask_points else [[]]
+        elif kind == "zone_lines":
+            op["shapes"] = [list(p) for p in self.pending_zone_lines] if self.pending_zone_lines else [[]]
         elif kind in ("zones", "objects"):
             existing = self.pending_roi_points if kind == "zones" else self.pending_object_points
             op["regions"] = {n: list(existing.get(n, [])) for n in names}
@@ -815,6 +824,23 @@ class MainWindow(QMainWindow):
 
         elif op["kind"] == "mask":
             self.pending_mask_points = [s for s in op["shapes"] if len(s) >= 3]
+
+        elif op["kind"] == "zone_lines":
+            strokes = [s for s in op["shapes"] if len(s) >= 2]
+            if not strokes:
+                QMessageBox.critical(self, "Not done", "Draw at least one line first.")
+                return
+            partitions, err = detect_zone_partitions(strokes, self.pending_warp_w, self.pending_warp_h)
+            if err:
+                QMessageBox.critical(self, "Could not detect zones", err)
+                return
+            self.pending_zone_lines = strokes
+            self.pending_roi_points = partitions
+            self.setup_page.set_roi_names_text(", ".join(partitions.keys()))
+            self.status_label.setText(
+                f"Detected {len(partitions)} zone(s): {', '.join(partitions.keys())} -- "
+                "name them in the Zone Formula box."
+            )
 
         elif op["kind"] in ("zones", "objects"):
             # Drop any auto-named placeholder that was never actually drawn
@@ -883,35 +909,14 @@ class MainWindow(QMainWindow):
         self.setup_page.refresh_canvas()
 
     def op_new_shape(self):
-        if self._op and self._op["kind"] == "mask":
+        if self._op and self._op["kind"] in ("mask", "zone_lines"):
             self._op["shapes"].append([])
             self.setup_page.update_op_instructions()
             self.setup_page.refresh_canvas()
 
     def _next_auto_zone_name(self, op):
-        """The name to pre-fill for the next not-yet-drawn zone. When this
-        op has a template_key (started from a Quick Setup apparatus tile --
-        see quick_setup_template), returns that apparatus's next UNUSED
-        suggested zone name in the template's own order (e.g. EPM: 'Center',
-        then 'Open Arm 1', 'Open Arm 2', 'Closed Arm 1', 'Closed Arm 2') --
-        prompt_zone_label's dialog pre-fills its combo box with this, so
-        drawing each arm in turn and clicking OK walks straight through the
-        template's checklist. Falls back to a plain 'Zone N' once every
-        suggestion is used (draw more zones than the template expects and
-        it just keeps counting) or when there's no template at all (plain
-        Draw Zones, unchanged from before)."""
-        template_key = op.get("template_key")
-        if template_key:
-            try:
-                suggestions = [label for label, _ in MAZE_TEMPLATES[template_key]["generate"](
-                    self.pending_warp_w, self.pending_warp_h,
-                    {p[0]: p[2] for p in MAZE_TEMPLATES[template_key]["params"]})]
-            except Exception:
-                suggestions = []
-            used = set(op["regions"].keys())
-            for label in suggestions:
-                if label not in used:
-                    return label
+        """The name to pre-fill for the next not-yet-drawn zone -- a plain
+        'Zone N', counting past whatever's already in this op's regions."""
         n = 1
         while f"Zone {n}" in op["regions"]:
             n += 1
@@ -1046,40 +1051,33 @@ class MainWindow(QMainWindow):
                     "inside a finished zone to rename it." if op["kind"] == "zones"
                     else " Click a name above to switch.")
             return f"Drawing {noun} '{name}' ({n} pts, need 3+) -- {mode_hint}{snap_hint}.{tail}"
+        elif op["kind"] == "zone_lines":
+            n_shapes = len(op["shapes"])
+            n_pts = len(op["shapes"][-1])
+            return (f"Line {n_shapes} ({n_pts} pts so far). Click to add points, tracing the "
+                    "apparatus's own dividers/walls -- 'New Shape' for another line, then "
+                    "Finish to auto-detect and letter the enclosed zones.")
         elif op["kind"] == "distance":
             return f"Click 2 points of known real-world distance ({len(op['points'])}/2 placed)."
         elif op["kind"] == "template_zones":
             # Only reachable from on_align_video (Batch queue's per-video
-            # "Align" button) now -- Quick Setup draws/names new zones the
-            # normal way (kind="zones") instead, see quick_setup_template.
+            # "Align" button).
             return (f"{len(op['regions'])} zone(s) from the template. Drag corners to fit THIS video's "
                     "own framing, then Finish to save just this video's alignment (other queued videos "
                     "are unaffected).")
         return ""
 
-    # -- "template_zones": a drag-corners-only op kind, still used by
+    # -- "template_zones": a drag-corners-only op kind, used by
     # on_align_video (Batch queue's per-video "Align" button) to nudge an
-    # ALREADY-drawn/named set of zones to fit a different video's framing --
-    # not for creating/naming new zones anymore (Quick Setup/quick_setup_template
-    # draws and names those the normal 'zones' way now; see its docstring). --
+    # ALREADY-drawn/named set of zones to fit a different video's framing. --
 
     def prompt_zone_label(self, op, current_name):
-        """Popup shown after clicking a template-generated zone on the
-        canvas: confirm the geometry's guess, pick a different one of the
-        template's suggested names (e.g. swap which arm is actually
-        'Open'), or type a custom name."""
-        template_key = op.get("template_key")
-        suggestions = []
-        if template_key:
-            try:
-                suggestions = [label for label, _ in MAZE_TEMPLATES[template_key]["generate"](
-                    self.pending_warp_w, self.pending_warp_h,
-                    {p[0]: p[2] for p in MAZE_TEMPLATES[template_key]["params"]})]
-            except Exception:
-                suggestions = []
+        """Popup shown after clicking a just-finished zone on the canvas
+        (or a template_zones align target): confirm the auto-suggested
+        name, pick a different existing one, or type a custom name."""
         existing_names = set(op["regions"].keys()) - {current_name}
         from qt_app.dialogs.zone_label_dialog import prompt_zone_label as _prompt
-        return _prompt(self, current_name, suggestions, existing_names)
+        return _prompt(self, current_name, [], existing_names)
 
     def _maybe_prompt_new_zone_name(self, op, name):
         """Draw Zones, Rectangle/Ellipse/Line tools only: called right after
@@ -1156,7 +1154,7 @@ class MainWindow(QMainWindow):
             elif len(op["shapes"][0]) < 4:
                 op["shapes"][0].append((fx, fy))
 
-        elif op["kind"] == "mask":
+        elif op["kind"] in ("mask", "zone_lines"):
             found = False
             for si, shape in enumerate(op["shapes"]):
                 idx = self._find_nearby_point(shape, fx, fy)
@@ -1307,6 +1305,7 @@ class MainWindow(QMainWindow):
         self.pending_roi_points = {}
         self.pending_object_points = {}
         self.pending_mask_points = []
+        self.pending_zone_lines = []
         self.pending_scale_factor = None
         self.pending_scale_unit = None
         self._op = None
@@ -1679,10 +1678,6 @@ class MainWindow(QMainWindow):
                 "max_area": float(sp.max_area_entry.text()),
                 "max_jump": float(sp.max_jump_entry.text()),
                 "use_zone_threshold": sp.use_zone_threshold_var.isChecked(),
-                "reject_shadows": sp.reject_shadows_var.isChecked() if getattr(sp, "reject_shadows_var", None) else False,
-                "use_window": sp.use_window_var.isChecked(),
-                "window_size": float(sp.window_size_entry.text()) if getattr(sp, "window_size_entry", None) is not None else 120.0,
-                "window_weight": float(sp.window_weight_entry.text()) if getattr(sp, "window_weight_entry", None) is not None else 0.5,
                 "scale_factor": self.pending_scale_factor,
                 "scale_unit": self.pending_scale_unit,
                 "preview_samples": int(float(sp.preview_samples_entry.text())),
@@ -1720,6 +1715,18 @@ class MainWindow(QMainWindow):
             zone_groups, _zone_assoc_err = parse_zone_associations(
                 zone_assoc_entry.text() if zone_assoc_entry is not None else ""
             )
+            # Zone Formula (optional) -- Draw Zone Lines' auto-detected A/B/
+            # C/... partitions, named/merged here ("A = Center", "B+C =
+            # Left Arm"). Feeds into the SAME zone_groups reporting
+            # machinery as Zone Associations above -- a formula name is
+            # just a group made of one or more partition letters instead of
+            # hand-drawn zones. Same "infallible here, validated in
+            # on_start" treatment as Zone Associations.
+            zone_formula_entry = getattr(sp, "zone_formula_entry", None)
+            partition_groups, _zone_formula_err = parse_partition_formula(
+                zone_formula_entry.text() if zone_formula_entry is not None else ""
+            )
+            zone_groups = {**zone_groups, **partition_groups}
             setup["zone_groups"] = zone_groups
 
             # Trajectory smoothing (optional) -- same "Standard-Tracking-
@@ -1872,6 +1879,26 @@ class MainWindow(QMainWindow):
                         self, "Invalid Zone Associations",
                         f"'{group_name}' references zone(s) that don't exist: {', '.join(unknown)} "
                         f"(current zones: {', '.join(known_zones) if known_zones else '(none)'})."
+                    )
+                    return
+
+        zone_formula_entry = getattr(sp, "zone_formula_entry", None)
+        if zone_formula_entry is not None and zone_formula_entry.text().strip():
+            partition_groups, zone_formula_err = parse_partition_formula(zone_formula_entry.text())
+            if zone_formula_err is not None:
+                QMessageBox.critical(self, "Invalid Zone Formula", zone_formula_err)
+                return
+            known_zones = [n.strip() for n in sp.roi_names_entry.text().split(",") if n.strip()] \
+                if getattr(sp, "roi_names_entry", None) else []
+            for group_name, members in partition_groups.items():
+                unknown = [m for m in members if known_zones and m not in known_zones]
+                if unknown:
+                    QMessageBox.critical(
+                        self, "Invalid Zone Formula",
+                        f"'{group_name}' references partition letter(s) that weren't detected: "
+                        f"{', '.join(unknown)} (current zones: "
+                        f"{', '.join(known_zones) if known_zones else '(none)'}). "
+                        "Draw Zone Lines first, then name the lettered zones here."
                     )
                     return
 
@@ -2777,8 +2804,7 @@ class MainWindow(QMainWindow):
         return ""
 
     # ------------------------------------------------------------------
-    # Dialogs (Manual Scoring, ML classifier) -- the old Maze Template
-    # dialog is gone; see quick_setup_template's docstring for why.
+    # Dialogs (Manual Scoring, ML classifier)
     # ------------------------------------------------------------------
 
     def on_manual_behavior_scoring(self):

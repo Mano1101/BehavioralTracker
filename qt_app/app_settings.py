@@ -30,8 +30,7 @@ SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 # load/save and the dialog can't drift out of sync with each other.
 SETTINGS_KEYS = [
     "bg_samples_entry", "threshold_entry", "min_area_entry", "max_area_entry",
-    "max_jump_entry", "window_size_entry", "window_weight_entry",
-    "use_window_var", "use_zone_threshold_var", "reject_shadows_var",
+    "max_jump_entry", "use_zone_threshold_var",
     "real_distance_entry", "units_entry", "preview_samples_entry",
     "color_mode_var", "bin_size_entry",
 ]
