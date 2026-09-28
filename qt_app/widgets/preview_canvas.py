@@ -34,6 +34,7 @@ MASK_COLOR = (0, 0, 0)
 ZONE_COLOR = (0, 0, 0)
 OBJECT_COLOR = (30, 105, 210)       # BGR for #d2691e (chocolate/orange)
 TEMPLATE_ZONE_COLOR = (204, 119, 0)  # BGR for #0077cc
+ZONE_LINE_COLOR = (0, 0, 220)        # red -- the in-progress wall/divider strokes
 DISTANCE_COLOR = (255, 0, 255)       # magenta
 GRID_COLOR = (222, 222, 222)         # faint light gray, snap-to-grid aid
 
@@ -51,18 +52,27 @@ def _overlay_sizes(frame):
     preview canvas, turning a thin line and small label into a thick,
     overlapping one. Scaling to the frame's own shorter side keeps
     overlays looking like the same weight of line/text regardless of how
-    tightly the video was cropped. The baseline itself is also smaller
-    than it used to be (MM: "the marking lines are very big, make
-    smaller")."""
+    tightly the video was cropped. The line baseline itself is also
+    smaller than it used to be (MM: "the marking lines are very big, make
+    smaller").
+
+    Font size/thickness deliberately use their OWN, higher floor
+    (font_s/its 0.55 floor below) instead of reusing the line scale's
+    lower one -- shrinking the boundary LINES earlier also shrank the
+    on-canvas zone LETTERS/labels right along with them (MM: labels
+    became unreadably small on a tightly cropped frame), which was never
+    the intent; decoupling the two keeps lines thin while labels stay a
+    normal, legible size."""
     h, w = frame.shape[:2]
     short_side = min(w, h) if min(w, h) > 0 else 800
-    s = max(0.35, min(1.5, short_side / 800.0))
+    line_s = max(0.35, min(1.5, short_side / 800.0))
+    font_s = max(0.55, min(1.5, short_side / 800.0))
     return {
-        "line": max(1, round(1 * s)),
-        "line_active": max(1, round(2 * s)),
-        "point_r": max(2, round(3 * s)),
-        "font_scale": round(0.38 * s, 3),
-        "font_thick": max(1, round(1 * s)),
+        "line": max(1, round(1 * line_s)),
+        "line_active": max(1, round(2 * line_s)),
+        "point_r": max(2, round(3 * line_s)),
+        "font_scale": round(0.5 * font_s, 3),
+        "font_thick": max(1, round(1.3 * font_s)),
     }
 
 
@@ -107,6 +117,23 @@ def _draw_polygon_set(frame, shapes, color, dashed=False, point_radius=None, act
         for p in pts:
             cv2.circle(frame, _pt(p), point_radius, color, -1, cv2.LINE_AA)
             cv2.circle(frame, _pt(p), point_radius, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def _draw_line_set(frame, shapes, color):
+    """OPEN polyline strokes (Draw Zone Lines' wall/divider tool) -- unlike
+    _draw_polygon_set, never closes a shape back to its first point: these
+    are walls being traced, not a zone outline, and the arena's own
+    rectangular border (drawn separately, see draw_op_overlay) is what
+    closes the space off, not the strokes themselves."""
+    sizes = _overlay_sizes(frame)
+    width = sizes["line_active"]
+    for pts in shapes:
+        if len(pts) >= 2:
+            for j in range(len(pts) - 1):
+                cv2.line(frame, _pt(pts[j]), _pt(pts[j + 1]), color, width, cv2.LINE_AA)
+        for p in pts:
+            cv2.circle(frame, _pt(p), sizes["point_r"], color, -1, cv2.LINE_AA)
+            cv2.circle(frame, _pt(p), sizes["point_r"], (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def _draw_grid(frame, spacing):
@@ -200,6 +227,13 @@ def draw_op_overlay(frame_bgr, op):
         _draw_polygon_set(disp, op["shapes"], (0, 0, 0))
     elif kind == "mask":
         _draw_polygon_set(disp, op["shapes"], MASK_COLOR, dashed=True, active_index=len(op["shapes"]) - 1)
+    elif kind == "zone_lines":
+        # The arena's own border is drawn too (not just the strokes) since
+        # it acts as the implicit outer wall detect_zone_partitions()
+        # assumes -- seeing it here previews exactly what Finish will use.
+        h, w = disp.shape[:2]
+        cv2.rectangle(disp, (0, 0), (w - 1, h - 1), ZONE_LINE_COLOR, sizes["line_active"])
+        _draw_line_set(disp, op["shapes"], ZONE_LINE_COLOR)
     elif kind == "zones":
         _draw_named_polygon_set(disp, op["regions"], ZONE_COLOR, active_region=op["active_region"])
     elif kind == "objects":
