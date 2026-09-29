@@ -273,7 +273,11 @@ class SetupPage(QWidget):
             self.rebuild_template_zone_buttons()
 
         if kind in ("mask", "zone_lines"):
-            new_shape_btn = QPushButton("New Line" if kind == "zone_lines" else "New Shape")
+            # "New Shape" even for zone_lines now -- the trace is a single
+            # closed outline (see main_window.py's finish_op), not a line;
+            # a second shape is only for an apparatus split into separate
+            # pieces on screen, same rare case "mask" uses it for.
+            new_shape_btn = QPushButton("New Shape")
             new_shape_btn.setObjectName("toolBtn")
             new_shape_btn.clicked.connect(self.app.op_new_shape)
             controls_row.addWidget(new_shape_btn)
@@ -779,7 +783,7 @@ class SetupPage(QWidget):
         tv.addWidget(QLabel("ROI names (comma-separated):"))
         self.roi_names_entry = QLineEdit(self.app._memory.get("roi_names_entry", ""))
         tv.addWidget(self.roi_names_entry)
-        tv.addWidget(_hint("Optional -- or click 'Draw Zones'/'Draw Zone Lines' below and name "
+        tv.addWidget(_hint("Optional -- or click 'Draw Zones'/'Draw Zone Outline' below and name "
                             "each zone as you draw it."))
         tv.addWidget(_hint("Object names (only used if Interaction Tracking is on):"))
         self.object_names_entry = QLineEdit(self.entry_or_default("object_names_entry", ""))
@@ -862,7 +866,7 @@ class SetupPage(QWidget):
             zone_formula_box = QGroupBox("Zone Formula (optional)")
             zfv = QVBoxLayout(zone_formula_box)
             zfv.addWidget(_hint(
-                "For zones from 'Draw Zone Lines' (auto-detected partitions A, B, C, ...): "
+                "For zones from 'Draw Zone Outline' (auto-detected arms/zones A, B, C, ...): "
                 "name them here -- 'A = Center', 'B+C = Left Arm', separated by ';'."
             ))
             self.zone_formula_entry = QLineEdit(self.entry_or_default("zone_formula_entry", ""))
@@ -928,11 +932,15 @@ class SetupPage(QWidget):
             ("zones", "Draw Zones", lambda: self.app.start_op("zones")),
         ]
         if mode == "standard":
-            # Line-based Zone Drawing: trace the apparatus's own dividers as
-            # lines, and the app auto-detects/letters the enclosed
-            # partitions (A, B, C, ...) -- named afterward in the Zone
-            # Formula box above (e.g. "A = Center", "B+C = Left Arm").
-            tools.append(("zone_lines", "Draw Zone Lines", lambda: self.app.start_op("zone_lines")))
+            # Outline-based Zone Drawing: trace the WHOLE apparatus's own
+            # outer outline as one closed shape, and the app works out on
+            # its own how many arms/partitions that shape naturally divides
+            # into and auto-letters them (A, B, C, ...) -- named afterward
+            # in the Zone Formula box above (e.g. "A = Center", "B+C = Left
+            # Arm"). Works for any star/branching apparatus (EPM, Y-maze,
+            # T-maze, radial-arm maze, ...); a shape with no branching at
+            # all (open field, round chamber) just becomes one zone.
+            tools.append(("zone_lines", "Draw Zone Outline", lambda: self.app.start_op("zone_lines")))
         tools += [
             ("objects", "Mark Objects", lambda: self.app.start_op("objects")),
             ("distance", "Calibrate Distance", lambda: self.app.start_op("distance")),
