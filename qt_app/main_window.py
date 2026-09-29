@@ -49,8 +49,8 @@ STOP_CONDITION_CODES = {
 
 
 def parse_partition_formula(text):
-    """Setup page's Zone Formula box (Draw Zone Lines' auto-detected A/B/C/
-    ... partitions): "A = Center; B+C = Left Arm" -> ({"Center": ["A"],
+    """Setup page's Zone Formula box (Draw Zone Outline's auto-detected
+    A/B/C/... arms/zones): "A = Center; B+C = Left Arm" -> ({"Center": ["A"],
     "Left Arm": ["B", "C"]}, None), or ({}, "<message>") for the first
     malformed piece found. Blank text is valid (no renaming applied -- the
     raw letters are used as-is). Same shape/style as parse_zone_associations
@@ -108,7 +108,7 @@ def parse_zone_associations(text):
 from tracking.location import (
     identity_transform, compute_perspective_transform, process_single_video,
     compute_output_dir, compute_zone_interaction_stats,
-    make_background, read_and_warp, detect_zone_partitions,
+    make_background, read_and_warp, detect_apparatus_partitions,
 )
 from tracking.two_mouse import (
     track_video, save_preview_frames as save_preview_frames_multi_mouse, choose_color_mode,
@@ -160,19 +160,22 @@ class MainWindow(QMainWindow):
         self.pending_roi_points = {}
         self.pending_object_points = {}
         self.pending_mask_points = []
-        # Raw wall/divider line strokes from the "Draw Zone Lines" tool
-        # (see start_op/finish_op's "zone_lines" kind) -- kept around so
+        # The traced apparatus outline(s) from the "Draw Zone Outline" tool
+        # (see start_op/finish_op's "zone_lines" kind) -- one closed shape
+        # per traced outline (usually just one; "New Shape" allows more,
+        # e.g. an apparatus split across the frame). Kept around so
         # reopening the tool starts from what was last drawn, same as
         # pending_mask_points does for Mask Zone.
         self.pending_zone_lines = []
         # Which tool last WROTE pending_roi_points -- "lines" (Draw Zone
-        # Lines' auto-detected partitions) or "manual" (Draw Zones, hand-
-        # drawn/edited). Draw Zones and Draw Zone Lines are two alternative
-        # ways to define the same zones, not two tools meant to be mixed:
-        # start_op reads this so opening Draw Zones right after a Draw Zone
-        # Lines run starts from a blank slate instead of silently pre-
-        # loading the auto-detected (many-point, not meant to be hand-
-        # edited) partition shapes under their auto-picked A/B/C names.
+        # Outline's auto-detected arms/zones) or "manual" (Draw Zones,
+        # hand-drawn/edited). Draw Zones and Draw Zone Outline are two
+        # alternative ways to define the same zones, not two tools meant
+        # to be mixed: start_op reads this so opening Draw Zones right
+        # after a Draw Zone Outline run starts from a blank slate instead
+        # of silently pre-loading the auto-detected (many-point, not
+        # meant to be hand-edited) shapes under their auto-picked A/B/C
+        # names.
         self._roi_points_source = None
         self.pending_scale_factor = None
         self.pending_scale_unit = None
@@ -731,7 +734,7 @@ class MainWindow(QMainWindow):
         self.setup_page.refresh_canvas()
 
     # ------------------------------------------------------------------
-    # Embedded operations: Crop / Mask / Zones / Zone Lines / Objects /
+    # Embedded operations: Crop / Mask / Zones / Zone Outline / Objects /
     # Distance (mirrors TrackerApp._start_op/_cancel_op/_finish_op and the
     # canvas mouse-event handlers in gui/main_window.py). The _op dict's
     # points are always stored in FRAME-pixel space (the same space as
@@ -781,8 +784,8 @@ class MainWindow(QMainWindow):
             op["shapes"] = [list(p) for p in self.pending_zone_lines] if self.pending_zone_lines else [[]]
         elif kind in ("zones", "objects"):
             # Draw Zones only resumes PREVIOUSLY HAND-DRAWN zones. If the
-            # current pending_roi_points instead came from Draw Zone Lines'
-            # auto-detected partitions (self._roi_points_source == "lines"),
+            # current pending_roi_points instead came from Draw Zone Outline's
+            # auto-detected arms/zones (self._roi_points_source == "lines"),
             # treat this as switching tools to start fresh by hand rather
             # than silently loading those many-point auto-traced shapes in
             # under their auto-picked A/B/C names -- see _roi_points_source's
@@ -848,15 +851,23 @@ class MainWindow(QMainWindow):
             self.pending_mask_points = [s for s in op["shapes"] if len(s) >= 3]
 
         elif op["kind"] == "zone_lines":
-            strokes = [s for s in op["shapes"] if len(s) >= 2]
-            if not strokes:
-                QMessageBox.critical(self, "Not done", "Draw at least one line first.")
+            # Trace the WHOLE apparatus's outer outline as one closed shape
+            # (occasionally a couple of disconnected ones -- "New Shape" --
+            # for an apparatus split across the frame) and let
+            # detect_apparatus_partitions work out on its own how many
+            # arms/partitions it naturally divides into -- see that
+            # function's own docstring. Each shape needs 3+ points to
+            # enclose any area at all, same as every other closed
+            # hand-drawn outline in this app (Mask Zone, Draw Zones).
+            outline_shapes = [s for s in op["shapes"] if len(s) >= 3]
+            if not outline_shapes:
+                QMessageBox.critical(self, "Not done", "Trace the apparatus's outer outline first.")
                 return
-            partitions, err = detect_zone_partitions(strokes, self.pending_warp_w, self.pending_warp_h)
+            partitions, err = detect_apparatus_partitions(outline_shapes, self.pending_warp_w, self.pending_warp_h)
             if err:
                 QMessageBox.critical(self, "Could not detect zones", err)
                 return
-            self.pending_zone_lines = strokes
+            self.pending_zone_lines = outline_shapes
             self.pending_roi_points = partitions
             self._roi_points_source = "lines"
             self.setup_page.set_roi_names_text(", ".join(partitions.keys()))
@@ -1079,9 +1090,9 @@ class MainWindow(QMainWindow):
         elif op["kind"] == "zone_lines":
             n_shapes = len(op["shapes"])
             n_pts = len(op["shapes"][-1])
-            return (f"Line {n_shapes} ({n_pts} pts so far). Click to add points, tracing the "
-                    "apparatus's own dividers/walls -- 'New Shape' for another line, then "
-                    "Finish to auto-detect and letter the enclosed zones.")
+            return (f"Shape {n_shapes} ({n_pts} pts, need 3+). Click to add points, tracing the "
+                    "WHOLE apparatus's own outer outline -- 'New Shape' only if it's split into "
+                    "separate pieces on screen, then Finish to auto-detect and letter its arms/zones.")
         elif op["kind"] == "distance":
             return f"Click 2 points of known real-world distance ({len(op['points'])}/2 placed)."
         elif op["kind"] == "template_zones":
@@ -1741,11 +1752,11 @@ class MainWindow(QMainWindow):
             zone_groups, _zone_assoc_err = parse_zone_associations(
                 zone_assoc_entry.text() if zone_assoc_entry is not None else ""
             )
-            # Zone Formula (optional) -- Draw Zone Lines' auto-detected A/B/
-            # C/... partitions, named/merged here ("A = Center", "B+C =
+            # Zone Formula (optional) -- Draw Zone Outline's auto-detected
+            # A/B/C/... arms/zones, named/merged here ("A = Center", "B+C =
             # Left Arm"). Feeds into the SAME zone_groups reporting
             # machinery as Zone Associations above -- a formula name is
-            # just a group made of one or more partition letters instead of
+            # just a group made of one or more lettered zones instead of
             # hand-drawn zones. Same "infallible here, validated in
             # on_start" treatment as Zone Associations.
             zone_formula_entry = getattr(sp, "zone_formula_entry", None)
@@ -1921,10 +1932,10 @@ class MainWindow(QMainWindow):
                 if unknown:
                     QMessageBox.critical(
                         self, "Invalid Zone Formula",
-                        f"'{group_name}' references partition letter(s) that weren't detected: "
+                        f"'{group_name}' references a lettered zone that wasn't detected: "
                         f"{', '.join(unknown)} (current zones: "
                         f"{', '.join(known_zones) if known_zones else '(none)'}). "
-                        "Draw Zone Lines first, then name the lettered zones here."
+                        "Draw Zone Outline first, then name the lettered zones here."
                     )
                     return
 
