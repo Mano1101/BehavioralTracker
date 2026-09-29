@@ -201,66 +201,30 @@ def _partition_letter(index):
     return letters
 
 
-def detect_zone_partitions(line_strokes, width, height, min_area_fraction=0.01, line_thickness=3):
-    """The "draw lines, not shapes" Zone Drawing workflow: the user traces
-    the apparatus's own internal walls/dividers as open line strokes (each
-    a list of (x, y) points) instead of tracing each zone's outline by
-    hand. The arena's own rectangular border acts as the outer wall
-    already enclosing everything, so the drawn lines only need to cover
-    the INTERNAL dividers, not retrace the frame edge.
+def _mask_to_polygon(region_mask, epsilon_frac=0.01):
+    """A binary (0/255) uint8 mask -> a simplified (x, y) polygon outline
+    (cv2.findContours + approxPolyDP), in exactly the shape
+    build_roi_masks()/roi_membership() already expect from a hand-drawn
+    zone. Returns None if the mask has no usable contour (empty, or the
+    simplified outline collapses to fewer than 3 points)."""
+    contours, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    epsilon = epsilon_frac * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
+    return pts if len(pts) >= 3 else None
 
-    Rasterizes those lines plus the arena border onto one mask, then finds
-    every enclosed open region (cv2.connectedComponentsWithStats on the
-    inverse of that mask) -- each one is a "partition". Partitions are
-    auto-labeled A, B, C, ... in reading order (top-to-bottom, then
-    left-to-right within a row of roughly-level partitions), and returned
-    as {letter: [(x, y), ...]} -- a simplified polygon outline for each
-    one, in exactly the same shape build_roi_masks()/roi_membership()
-    already expect from a hand-drawn zone, so a detected partition plugs
-    straight into the existing tracking/reporting pipeline unchanged.
 
-    Returns ({}, "<message>") if no strokes divide the arena into more
-    than one region, or every region found is smaller than
-    min_area_fraction of the arena (stray clicks/noise)."""
-    walls = np.zeros((height, width), dtype=np.uint8)
-    cv2.rectangle(walls, (0, 0), (width - 1, height - 1), 255, line_thickness)
-    for stroke in line_strokes:
-        if len(stroke) < 2:
-            continue
-        pts = np.array(stroke, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(walls, [pts], False, 255, line_thickness)
-
-    open_space = cv2.bitwise_not(walls)
-    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(open_space, connectivity=4)
-
-    min_area = min_area_fraction * width * height
-    found = []  # (cy, cx, polygon points)
-    for label in range(1, n_labels):  # label 0 is the wall/background pixels
-        if stats[label, cv2.CC_STAT_AREA] < min_area:
-            continue
-        region_mask = (labels == label).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        contour = max(contours, key=cv2.contourArea)
-        epsilon = 0.01 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
-        if len(pts) < 3:
-            continue
-        cx, cy = centroids[label]
-        found.append((float(cy), float(cx), pts))
-
-    if not found:
-        return {}, ("No enclosed zones were found -- the lines need to fully divide the arena "
-                     "(reaching the frame edge or each other, with no gaps) into 2 or more parts.")
-
-    # Reading order: top-to-bottom, then left-to-right -- bucket into
-    # "rows" of roughly-level partitions first (within row_tol of each
-    # other) so e.g. two side-by-side arms read left-then-right before
-    # dropping to the next row, rather than being ordered by exact pixel
-    # y (which would interleave rows on the slightest camera tilt).
-    found.sort(key=lambda p: p[0])
+def _order_reading_order(found, height):
+    """found: [(cy, cx, pts), ...] -> the same entries reordered top-to-
+    bottom, then left-to-right -- bucketing into "rows" of roughly-level
+    partitions first (within row_tol of each other) so e.g. two side-by-
+    side arms read left-then-right before dropping to the next row,
+    rather than being ordered by exact pixel y (which would interleave
+    rows on the slightest camera tilt)."""
+    found = sorted(found, key=lambda p: p[0])
     row_tol = max(20.0, height * 0.08)
     rows = []
     for cy, cx, pts in found:
@@ -269,12 +233,427 @@ def detect_zone_partitions(line_strokes, width, height, min_area_fraction=0.01, 
             rows.append([cy, [(cy, cx, pts)]])
         else:
             placed_row[1].append((cy, cx, pts))
-
     ordered = []
     for _row_cy, items in rows:
         items.sort(key=lambda p: p[1])
         ordered.extend(items)
+    return ordered
 
+
+# -----------------------------
+# Apparatus-outline auto-decomposition -- the "trace the whole apparatus"
+# Zone Drawing workflow. There is no ready-made skeletonize() available in
+# this build (scikit-image isn't installed, and plain opencv-python here
+# has no cv2.ximgproc thinning either), so _zhang_suen_thin hand-rolls the
+# classic 1984 two-subiteration thinning algorithm, vectorized with NumPy
+# array shifts instead of a per-pixel Python loop.
+# -----------------------------
+
+
+def _shift_neighbors(img):
+    """The 8 neighbors of every pixel in `img` (a 0/1 array), clockwise
+    from north (P2..P9 in the classic Zhang-Suen naming), each as a
+    same-shape array aligned to img -- neighbors[k][r, c] is img's pixel
+    in direction k from (r, c). A pixel off the array's edge reads as 0
+    (padding), which is exactly "not foreground" -- the right answer for
+    a skeleton that never wraps around the frame border."""
+    h, w = img.shape
+    padded = np.zeros((h + 2, w + 2), dtype=img.dtype)
+    padded[1:-1, 1:-1] = img
+    p2 = padded[0:h, 1:w + 1]      # N
+    p3 = padded[0:h, 2:w + 2]      # NE
+    p4 = padded[1:h + 1, 2:w + 2]  # E
+    p5 = padded[2:h + 2, 2:w + 2]  # SE
+    p6 = padded[2:h + 2, 1:w + 1]  # S
+    p7 = padded[2:h + 2, 0:w]      # SW
+    p8 = padded[1:h + 1, 0:w]      # W
+    p9 = padded[0:h, 0:w]          # NW
+    return p2, p3, p4, p5, p6, p7, p8, p9
+
+
+def _zhang_suen_thin(mask01, max_iterations=500):
+    """Zhang-Suen thinning: reduces a filled binary shape (mask01: 0/1
+    uint8 array, foreground=1) down to its 1-pixel-wide medial-axis
+    skeleton. This is what detect_apparatus_partitions reads the traced
+    apparatus's branching structure from -- a plain blob (open field)
+    thins down to one simple strand with no junctions; a star/plus shape
+    (EPM, Y-maze, radial-arm maze, ...) thins down to one strand per arm,
+    all meeting at a junction cluster in the middle."""
+    img = mask01.astype(np.uint8).copy()
+    for _ in range(max_iterations):
+        changed = False
+        for step in (1, 2):
+            p2, p3, p4, p5, p6, p7, p8, p9 = _shift_neighbors(img)
+            b = (p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9).astype(np.uint8)
+            a = (
+                ((p2 == 0) & (p3 == 1)).astype(np.uint8)
+                + ((p3 == 0) & (p4 == 1)).astype(np.uint8)
+                + ((p4 == 0) & (p5 == 1)).astype(np.uint8)
+                + ((p5 == 0) & (p6 == 1)).astype(np.uint8)
+                + ((p6 == 0) & (p7 == 1)).astype(np.uint8)
+                + ((p7 == 0) & (p8 == 1)).astype(np.uint8)
+                + ((p8 == 0) & (p9 == 1)).astype(np.uint8)
+                + ((p9 == 0) & (p2 == 1)).astype(np.uint8)
+            )
+            if step == 1:
+                cond = (p2 * p4 * p6 == 0) & (p4 * p6 * p8 == 0)
+            else:
+                cond = (p2 * p4 * p8 == 0) & (p2 * p6 * p8 == 0)
+            to_remove = (img == 1) & (b >= 2) & (b <= 6) & (a == 1) & cond
+            if np.any(to_remove):
+                img[to_remove] = 0
+                changed = True
+        if not changed:
+            break
+    return img
+
+
+def _skeleton_neighbor_counts(skel01):
+    p2, p3, p4, p5, p6, p7, p8, p9 = _shift_neighbors(skel01.astype(np.uint8))
+    return p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+
+
+def _build_redundant_neighborhood_lut():
+    """256-entry lookup, indexed by an 8-bit pattern of which of a
+    pixel's 8 ring neighbors (bit k = P(2+k) in the classic Zhang-Suen
+    ordering N, NE, E, SE, S, SW, W, NW, k=0..7) are foreground: True
+    when those neighbors are ALL already mutually reachable from one
+    another directly, without going through the shared center pixel --
+    i.e. the center pixel is topologically redundant for connectivity.
+
+    Two ring positions are themselves directly (8-)adjacent to each
+    other exactly when they're at most 2 apart in this cyclic order (N &
+    NE are next-door; N & E are also directly diagonal-adjacent to each
+    other even though NE sits between them in the ring; N & SE, or N &
+    S opposite, are not). Zhang-Suen's own "A(P)==1" transition test
+    (used inside _zhang_suen_thin) only checks ring-CONSECUTIVE runs, so
+    it misses exactly this ring-distance-2 case -- e.g. a pixel whose
+    only two foreground neighbors are due-east and due-south (ring
+    positions E, S -- distance 2 apart the short way around, through the
+    empty SE between them) reads as "2 separate arcs" to that test even
+    though E and S are already directly diagonal-adjacent to each other.
+    This is exactly the "elbow" a diagonal thinned run characteristically
+    leaves behind (see _remove_redundant_junction_pixels), and this LUT
+    correctly marks that pattern as redundant where the simpler
+    consecutive-arc test would not."""
+    def _adjacent(i, j):
+        d = abs(i - j) % 8
+        d = min(d, 8 - d)
+        return 0 < d <= 2
+
+    lut = np.zeros(256, dtype=bool)
+    for pattern in range(256):
+        present = [k for k in range(8) if (pattern >> k) & 1]
+        if len(present) < 2:
+            continue
+        visited = {present[0]}
+        frontier = [present[0]]
+        while frontier:
+            cur = frontier.pop()
+            for k in present:
+                if k not in visited and _adjacent(cur, k):
+                    visited.add(k)
+                    frontier.append(k)
+        lut[pattern] = len(visited) == len(present)
+    return lut
+
+
+_REDUNDANT_NEIGHBORHOOD_LUT = _build_redundant_neighborhood_lut()
+
+
+def _remove_redundant_junction_pixels(skel01, max_iterations=50):
+    """Removes a foreground pixel whose foreground neighbors are all
+    ALREADY directly connected to each other without it (see
+    _build_redundant_neighborhood_lut) -- by definition safe, since no
+    neighbor relies on this pixel to reach any other. Thinning's own
+    per-sub-iteration conditions (there to stop a 1px-wide line from
+    being erased outright) occasionally leave one of these behind on a
+    diagonal run anyway, reading as a spurious degree>=3 "junction" where
+    no real branch point exists.
+
+    This sweeps up exactly that pattern (degree >= 3 AND topologically
+    redundant) and nothing else: a GENUINE junction -- three or four arms
+    meeting at one pixel -- has its neighbors sitting in 2+ truly
+    SEPARATE groups (there's no way to walk from one arm's direction to
+    another's without crossing the junction pixel itself), so the LUT
+    reads False there and this leaves it untouched.
+
+    Redundant-for-ITS-OWN-neighbors doesn't mean safe to remove several
+    such pixels all AT ONCE, though: two ADJACENT "redundant" pixels can
+    each individually check out fine (each one's own neighbors stay
+    connected without IT) while secretly relying on EACH OTHER -- remove
+    both together and the line between them still breaks. So removal is
+    done in 4 interleaved sub-passes by (row%2, col%2) class, recomputing
+    which pixels still qualify before each one: any two pixels in the
+    same class are always at least 2 apart in row or column, so they're
+    never 8-adjacent to each other and a whole class can safely be
+    removed together in one vectorized pass."""
+    skel = skel01.astype(np.uint8).copy()
+    h, w = skel.shape
+    row_parity = (np.arange(h) % 2).reshape(-1, 1)
+    col_parity = (np.arange(w) % 2).reshape(1, -1)
+    class_masks = [(row_parity == rp) & (col_parity == cp) for rp in (0, 1) for cp in (0, 1)]
+
+    for _ in range(max_iterations):
+        any_removed = False
+        for cmask in class_masks:
+            p2, p3, p4, p5, p6, p7, p8, p9 = _shift_neighbors(skel)
+            b = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+            pattern = (
+                p2.astype(np.int32) | (p3.astype(np.int32) << 1) | (p4.astype(np.int32) << 2)
+                | (p5.astype(np.int32) << 3) | (p6.astype(np.int32) << 4) | (p7.astype(np.int32) << 5)
+                | (p8.astype(np.int32) << 6) | (p9.astype(np.int32) << 7)
+            )
+            redundant = (skel == 1) & (b >= 3) & _REDUNDANT_NEIGHBORHOOD_LUT[pattern] & cmask
+            if np.any(redundant):
+                skel[redundant] = 0
+                any_removed = True
+        if not any_removed:
+            break
+    return skel
+
+
+def _prune_skeleton_spurs(skel01, iterations):
+    """Erode away short spurs from a skeleton by repeatedly deleting
+    endpoint pixels (skeleton pixels with exactly 1 skeleton neighbor),
+    `iterations` times. A spur shorter than `iterations` pixels
+    disappears entirely -- this is what a straight/rectangular arm TIP's
+    medial axis characteristically produces (the axis forks into two
+    short branches approaching each corner of the flat end before
+    merging into the main strand), a corner artifact rather than a real
+    branch. A real arm strand is far longer than that, so it just loses
+    a few pixels off its tip and otherwise survives, separately labeled.
+    Only used to decide which branches are real (see
+    _partition_one_blob) -- never to build the final zone shapes, which
+    come from watershed-growing the untouched filled mask outward from
+    each surviving branch's own seed."""
+    skel = skel01.astype(np.uint8).copy()
+    for _ in range(iterations):
+        neighbor_count = _skeleton_neighbor_counts(skel)
+        endpoints = (skel == 1) & (neighbor_count == 1)
+        if not np.any(endpoints):
+            break
+        skel[endpoints] = 0
+    return skel
+
+
+def _partition_one_blob(comp_mask, offset, min_area_fraction):
+    """One connected filled blob (comp_mask: 0/1 uint8, cropped to its own
+    bounding box) -> a list of (cy, cx, pts) in FULL-FRAME coordinates
+    (offset = the crop's (x0, y0) in the full frame, added back onto
+    every point/centroid before returning). See detect_apparatus_partitions
+    for the overall algorithm this implements."""
+    ox, oy = offset
+    ch, cw = comp_mask.shape
+    comp_area = int(comp_mask.sum())
+    min_dim = max(1, min(cw, ch))
+
+    def _whole_blob_as_one_zone():
+        pts = _mask_to_polygon((comp_mask * 255).astype(np.uint8))
+        if pts is None:
+            return []
+        pts_full = [(x + ox, y + oy) for x, y in pts]
+        cx = float(np.mean([p[0] for p in pts_full]))
+        cy = float(np.mean([p[1] for p in pts_full]))
+        return [(cy, cx, pts_full)]
+
+    # A hand-traced outline is never pixel-perfectly smooth -- clicking a
+    # curve or a straight edge as a handful of points instead of tracing
+    # every pixel leaves small in/out wiggles along the boundary, and a
+    # medial-axis skeleton is notoriously sensitive to exactly that kind
+    # of small-scale boundary noise (each little wiggle can throw off its
+    # own short spurious branch). Skeletonize a lightly SMOOTHED copy of
+    # the filled mask instead of the raw one -- opening then closing with
+    # a kernel much smaller than any real arm should be, so it rounds off
+    # small trace jitter without eating into (or bridging across) an
+    # actual narrow arm. The untouched, un-smoothed comp_mask is still
+    # what the final zones are grown over below (via watershed), so this
+    # only affects which branches are FOUND, never the shape of a zone.
+    smooth_px = max(2, round(0.012 * min_dim))
+    smooth_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (smooth_px * 2 + 1, smooth_px * 2 + 1))
+    smoothed = cv2.morphologyEx((comp_mask * 255).astype(np.uint8), cv2.MORPH_OPEN, smooth_kernel)
+    smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, smooth_kernel)
+    smoothed = (smoothed > 0).astype(np.uint8)
+    if not np.any(smoothed):
+        smoothed = comp_mask  # a shape thinner than the smoothing kernel itself -- don't erase it away
+
+    skel = _zhang_suen_thin(smoothed)
+    if not np.any(skel):
+        return _whole_blob_as_one_zone()
+    skel = _remove_redundant_junction_pixels(skel)
+
+    # A straight/rectangular arm TIP's own medial axis characteristically
+    # forks into two short branches approaching each corner of the flat
+    # end before merging into the main strand -- a shape artifact, not a
+    # real fork, and the sharper the corner the more of these show up
+    # (e.g. every corner along a jittery hand-drawn trace). A LIGHT fixed
+    # prune first soaks up single-pixel jaggies from thinning a rasterized
+    # polygon; telling a genuine short arm apart from a corner-fork spur
+    # then happens below by comparing each candidate branch's length to
+    # the corridor's own local width (distance transform), NOT a fixed
+    # pixel count -- a fixed threshold can't work across arms of very
+    # different widths (a maze's 20px-wide arms vs. its 80px-wide ones)
+    # or across very different overall apparatus sizes.
+    skel_pruned = _prune_skeleton_spurs(skel, max(3, round(0.01 * min_dim)))
+    dt = cv2.distanceTransform((comp_mask * 255).astype(np.uint8), cv2.DIST_L2, 5)
+
+    neighbor_count = _skeleton_neighbor_counts(skel_pruned)
+    junctions = (skel_pruned == 1) & (neighbor_count >= 3)
+    if not np.any(junctions):
+        # A single strand, no branching at all -- e.g. an open-field
+        # arena or a round chamber. Nothing to decompose.
+        return _whole_blob_as_one_zone()
+
+    # A little breathing room around each junction so an arm's own
+    # branch-component doesn't include a stray junction-adjacent pixel,
+    # and so the hub-area check below reflects the junction's real
+    # footprint rather than a single skeleton pixel.
+    junction_halo_px = max(2, round(0.02 * min_dim))
+    halo_kernel = np.ones((junction_halo_px * 2 + 1, junction_halo_px * 2 + 1), dtype=np.uint8)
+    junctions_dilated = cv2.dilate(junctions.astype(np.uint8), halo_kernel)
+
+    arm_skel = (skel_pruned == 1) & (junctions_dilated == 0)
+    n_arm_labels, arm_labels, arm_stats, _ = cv2.connectedComponentsWithStats(
+        arm_skel.astype(np.uint8), connectivity=8
+    )
+    real_arms = []
+    for lbl in range(1, n_arm_labels):
+        branch_len_px = int(arm_stats[lbl, cv2.CC_STAT_AREA])  # skeleton is 1px wide -> area ~= path length
+        if branch_len_px < 3:
+            continue
+        branch_pixels = arm_labels == lbl
+        local_half_width = float(dt[branch_pixels].mean())
+        # A real arm reads as clearly LONGER than the corridor is wide; a
+        # corner-fork spur is on the order of the corridor's own
+        # half-width, rarely more -- the multiplier just needs to sit
+        # comfortably between those two cases.
+        min_len_for_real_arm = max(8.0, 2.5 * local_half_width)
+        if branch_len_px >= min_len_for_real_arm:
+            real_arms.append(lbl)
+
+    if len(real_arms) < 2:
+        # Not enough surviving branches to call this "branching" -- (0:
+        # skeletonization noise; 1: a single strand plus a stray junction
+        # pixel from a slightly lumpy trace) -- treat it the same as a
+        # non-branching shape.
+        return _whole_blob_as_one_zone()
+
+    # Seed markers for cv2.watershed: 1 = outside the traced outline
+    # (never grown into), 0 = unassigned (grown into from whichever
+    # numbered seed reaches it first BY SHORTEST PATH THROUGH THE SHAPE,
+    # not a straight line -- watershed on a flat/gradient-less image is
+    # exactly a geodesic-nearest-seed partition, so it correctly follows
+    # a bent or branching corridor instead of jumping across a concave
+    # inner corner the way straight-line nearest-neighbor would), 2.. =
+    # one per arm (+ the junction hub, if it's more than just a crossing
+    # point -- see below).
+    markers = np.zeros((ch, cw), dtype=np.int32)
+    markers[comp_mask == 0] = 1
+
+    seed_kernel = np.ones((3, 3), dtype=np.uint8)
+    next_id = 2
+    for lbl in real_arms:
+        arm_mask = (arm_labels == lbl).astype(np.uint8)
+        arm_seed = cv2.dilate(arm_mask, seed_kernel) & comp_mask
+        markers[arm_seed == 1] = next_id
+        next_id += 1
+
+    hub_area_threshold = max(min_area_fraction * comp_area, 1)
+    n_hub_labels, hub_labels, hub_stats, _ = cv2.connectedComponentsWithStats(
+        (junctions_dilated & comp_mask), connectivity=8
+    )
+    for lbl in range(1, n_hub_labels):
+        if hub_stats[lbl, cv2.CC_STAT_AREA] < hub_area_threshold:
+            continue  # just a crossing point -- let the arms split it between them
+        hub_seed = (hub_labels == lbl) & (markers == 0)
+        if np.any(hub_seed):
+            markers[hub_seed] = next_id
+            next_id += 1
+
+    flat_bgr = np.zeros((ch, cw, 3), dtype=np.uint8)
+    cv2.watershed(flat_bgr, markers)
+
+    found = []
+    for region_id in range(2, next_id):
+        region_mask = (markers == region_id).astype(np.uint8) * 255
+        pts = _mask_to_polygon(region_mask)
+        if pts is None:
+            continue
+        pts_full = [(x + ox, y + oy) for x, y in pts]
+        cx = float(np.mean([p[0] for p in pts_full]))
+        cy = float(np.mean([p[1] for p in pts_full]))
+        found.append((cy, cx, pts_full))
+    return found if found else _whole_blob_as_one_zone()
+
+
+def detect_apparatus_partitions(outline_shapes, width, height, min_area_fraction=0.01):
+    """The "trace the whole apparatus" Zone Drawing workflow: the user
+    traces the apparatus's own OUTER outline once, as a single closed
+    shape (occasionally a couple of disconnected ones -- see "New Shape"
+    -- for an apparatus split across the frame), instead of drawing its
+    internal walls/dividers by hand or tracing each zone one at a time.
+    From that one traced outline, this works out on its own how many
+    arms/partitions the shape naturally divides into (an EPM's 4 arms +
+    center, a Y-maze's 3 arms, a T-maze's 3, a radial-arm maze's N, ... or,
+    for a shape with no branching at all -- a plain open-field arena, a
+    round chamber -- just the ONE zone the outline already is) and
+    auto-labels each one A, B, C, ... directly on the image; the
+    researcher assigns the real arm/zone names afterward in the Zone
+    Formula box, same as with the old divider-lines workflow.
+
+    How (see _partition_one_blob for the per-blob detail): fill the
+    traced outline(s) into one binary mask; for each disconnected filled
+    blob, thin it to its medial-axis skeleton, find where it branches
+    (junctions) vs. its individual arm strands, and -- with 2 or more real
+    arms -- geodesically grow each arm (plus the junction hub itself, AS
+    ITS OWN zone, if it has real area of its own rather than being just a
+    crossing point) out to fill the whole blob via watershed. A blob with
+    no branching is returned whole, as ONE zone.
+
+    Because the user's own trace is always ONE ALREADY-CLOSED shape (its
+    last point auto-connects back to the first, same as every other
+    hand-drawn zone/mask outline in this app), there's no equivalent of
+    the old divider-lines workflow's "lines didn't quite meet, so open
+    space leaked through and silently merged what should've been separate
+    zones" failure mode -- an imprecise click just makes the traced
+    outline a little lumpy, never a gap in a wall.
+
+    Returns ({letter: [(x, y), ...], ...}, None) on success, or
+    ({}, "<message>") if no usable outline was traced.
+    """
+    shapes = [s for s in outline_shapes if len(s) >= 3]
+    if not shapes:
+        return {}, "Trace the apparatus's outer outline first (click to add points, then Finish)."
+
+    filled = np.zeros((height, width), dtype=np.uint8)
+    for shape in shapes:
+        cv2.fillPoly(filled, [np.array(shape, dtype=np.int32)], 255)
+
+    if not np.any(filled):
+        return {}, "The traced outline is empty -- trace the apparatus's outer outline first."
+
+    min_area = min_area_fraction * width * height
+    n_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
+
+    found = []  # (cy, cx, pts), pooled across every disconnected traced blob
+    for comp_label in range(1, n_labels):
+        if stats[comp_label, cv2.CC_STAT_AREA] < min_area:
+            continue
+        x0 = stats[comp_label, cv2.CC_STAT_LEFT]
+        y0 = stats[comp_label, cv2.CC_STAT_TOP]
+        cw = stats[comp_label, cv2.CC_STAT_WIDTH]
+        ch = stats[comp_label, cv2.CC_STAT_HEIGHT]
+        pad = 2
+        cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
+        cx1, cy1 = min(width, x0 + cw + pad), min(height, y0 + ch + pad)
+        comp_mask = (labels[cy0:cy1, cx0:cx1] == comp_label).astype(np.uint8)
+
+        found.extend(_partition_one_blob(comp_mask, offset=(cx0, cy0), min_area_fraction=min_area_fraction))
+
+    if not found:
+        return {}, "No usable zone was found in the traced outline -- trace the apparatus's outer outline again."
+
+    ordered = _order_reading_order(found, height)
     return {_partition_letter(i): pts for i, (_cy, _cx, pts) in enumerate(ordered)}, None
 
 
