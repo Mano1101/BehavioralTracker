@@ -10,8 +10,10 @@ workum randu perum best haa panni thanga" message):
    analysis type): the tile list + detail QStackedWidget exist, list the
    expected operations, and clicking a tile actually swaps the detail
    pane and restyles the tiles. The video queue (displaced from its old
-   spot as the sole LEFT column) still works, just relocated to the
-   RIGHT side.
+   spot as the sole LEFT column while the settings panel was introduced)
+   still works, now living at the TOP of the same Settings area, above
+   the tiles (it was briefly its own column -- right, then left -- before
+   MM asked for it to just sit inside the Settings area instead).
 
 2. The Qt wiring for "auto-mask everything outside my zones": the new
    Setup-page checkbox (default ON) -> MainWindow._build_setup's
@@ -225,8 +227,8 @@ win.setup_page.rebuild(resave=False)
 app.processEvents()
 check_master_detail("Behavior Classification", EXPECTED_BEHAVIOR_TILES)
 
-# The video queue moved to the RIGHT side (out of the master-detail panel
-# on the left) -- still present and working, just relocated.
+# The video queue now sits at the TOP of the master-detail settings
+# panel itself -- still present and working, just relocated.
 check("the queued video's name still appears somewhere on the Setup page",
       any(os.path.basename(VIDEO_PATH) in lbl.text() for lbl in win.setup_page.findChildren(QLabel)))
 

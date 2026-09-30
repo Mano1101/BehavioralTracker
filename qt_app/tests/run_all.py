@@ -33,6 +33,7 @@ ORDERED_TESTS = [
     "test_canvas_smoke.py",
     "test_tracking_robustness.py",
     "test_auto_mask_outside_zones.py",
+    "test_multi_mouse_kalman_tracking.py",
     "test_stop_conditions.py",
     "test_zone_associations.py",
     "test_trajectory_smoothing.py",
