@@ -12,7 +12,7 @@ import os
 
 import cv2
 import pandas as pd
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
@@ -330,9 +330,39 @@ class ResultsPage(QWidget):
                 # wrong-sized (often tiny) frozen pixmap that never
                 # corrected itself, since a QLabel doesn't auto-rescale a
                 # pixmap you set on it. Scaling to the fixed height and
-                # centering (AlignCenter above) sidesteps the problem
-                # entirely instead of needing a resize-aware subclass.
+                # centering (AlignCenter above) sidesteps the problem for
+                # the common case (never a blank panel while waiting).
                 pic.setPixmap(pix.scaledToHeight(panel_h, Qt.SmoothTransformation))
+
+                # Height-only scaling isn't enough on its own though: Zone
+                # Occupancy's chart is a fixed 9in WIDE regardless of how
+                # many zones it lists (see save_zone_occupancy_chart), so a
+                # run with few zones, or one dominant zone whose value
+                # label sits far to the right of its bar, renders
+                # proportionally wide -- at panel_h alone that can end up
+                # wider than this panel's real ~1/3 share of the row, and
+                # a QLabel doesn't shrink a pixmap that's bigger than its
+                # own rect, it just silently clips it (this is exactly
+                # what was cutting off the longest zone's own bar and its
+                # "50.1s"-style value label). Once this event loop tick
+                # finishes and the real layout has run, pic.width() is the
+                # label's true assigned width -- re-scale to fit within
+                # THAT too (still preserving aspect ratio), so nothing
+                # ever renders wider than its panel. A one-shot re-fit
+                # (rather than a resize-aware subclass) is enough since
+                # this page's charts don't need to keep re-fitting on
+                # every later manual window resize, same trade-off
+                # Trajectory/Heatmap already accepted here.
+                def _refit_to_panel_width(pic=pic, pix=pix):
+                    try:
+                        avail_w = pic.width()
+                        if avail_w > 0:
+                            pic.setPixmap(pix.scaled(
+                                avail_w, panel_h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    except RuntimeError:
+                        pass  # pic was already deleted (page rebuilt before this fired)
+
+                QTimer.singleShot(0, _refit_to_panel_width)
             panel.addWidget(pic)
             views_row.addLayout(panel)
         center.addLayout(views_row)

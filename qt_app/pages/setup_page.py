@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QCheckBox, QRadioButton, QGroupBox, QScrollArea,
     QFrame, QProgressBar, QSizePolicy, QMessageBox, QPlainTextEdit,
+    QStackedWidget,
 )
 
 from qt_app.theme import PALETTE
@@ -64,7 +65,7 @@ class SetupPage(QWidget):
         "loc_var", "interact_var", "entries_var", "altern_var", "all_var",
         "behavior_rearing_var", "behavior_grooming_var", "behavior_locomotion_var",
         "behavior_immobile_var", "behavior_all_var", "ml_mode_var",
-        "smooth_trajectory_var",
+        "smooth_trajectory_var", "auto_mask_outside_zones_var",
     ]
 
     def __init__(self, app):
@@ -701,7 +702,11 @@ class SetupPage(QWidget):
                 v.addWidget(r)
         parent_layout.addWidget(box)
 
-    def _detection_settings(self, parent_layout, mode):
+    def _detection_settings_box(self, parent_layout, mode):
+        """Detection Settings tile: color mode, the core detection knobs,
+        auto-mask-outside-zones, and distance calibration. Split out of
+        the old combined _detection_settings so Time Bins (below) can be
+        its own separate operation tile in the master-detail layout."""
         self._color_mode_group(parent_layout)
 
         default_min_area = 15 if mode == "standard" else 150
@@ -725,6 +730,32 @@ class SetupPage(QWidget):
             self.use_zone_threshold_var.setChecked(self.var_or_default("use_zone_threshold_var", False))
             self.use_zone_threshold_var.hide()
 
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
+        v.addWidget(sep2)
+        # Auto-mask outside my zones (MM asked for this "aganum" -- on by
+        # default): once zones are drawn/finalized, everything outside
+        # them is excluded from detection automatically -- see
+        # build_exclusion_mask (Standard Tracking) / _prepare_source_video
+        # (Multi-Mouse, Behavior Classification) in tracking/location.py
+        # and main_window.py. Crop Arena already does this inherently
+        # (warpPerspective only ever keeps the cropped interior), so this
+        # checkbox only ever affects the extra area outside drawn zones.
+        self.auto_mask_outside_zones_var = QCheckBox("Auto-mask everything outside my zones")
+        self.auto_mask_outside_zones_var.setChecked(self.var_or_default("auto_mask_outside_zones_var", True))
+        if mode == "behavior":
+            # Behavior Classification never draws zones, so this has
+            # nothing to act on -- keep the variable (setup_page.rebuild
+            # and _build_setup both reference it generically) but hide
+            # the control itself, same pattern as use_zone_threshold_var.
+            self.auto_mask_outside_zones_var.hide()
+        else:
+            v.addWidget(self.auto_mask_outside_zones_var)
+            v.addWidget(_hint(
+                "Once you've drawn and finished your zones ('Draw Zones' / 'Draw Zone Outline' "
+                "below), anything outside them is ignored -- Crop Arena already does this for "
+                "anything outside the cropped area, this extends it to the zones themselves."
+            ))
+
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
         v.addWidget(sep)
         v.addWidget(QLabel("Distance calibration (optional)"))
@@ -735,15 +766,15 @@ class SetupPage(QWidget):
 
         parent_layout.addWidget(box)
 
+    def _time_bins_box(self, parent_layout):
         # Time Bins (optional) -- Upgrade Plan Tier 2 #9, EthoVision's Time
         # Bins/Nesting: how big a slice of the run each row of the "1min
         # Individual"/"1min Cumulative" report sheets covers (Standard
         # Tracking), or the equivalent per-mouse time_bins.csv (Multi-
         # Mouse/Behavior Classification -- see tracking.two_mouse.
         # calculate_time_bins / tracking.behavior.calculate_behavior_
-        # time_bins). Lives here, in the ONE setup body shared by all
-        # three analysis types, rather than the Standard-only groupboxes
-        # above it, so it actually reaches every analysis type as asked.
+        # time_bins). Its own operation tile now, reached from all three
+        # analysis types the same way (see _build_operation_master_detail).
         bins_box = QGroupBox("Time Bins (optional)")
         binv = QVBoxLayout(bins_box)
         binv.addWidget(_hint(
@@ -754,160 +785,257 @@ class SetupPage(QWidget):
         parent_layout.addWidget(bins_box)
 
     # ------------------------------------------------------------------
+    # Master-detail settings panel (MM asked for this): a column of
+    # clickable operation tiles next to a detail pane that shows only the
+    # selected tile's own parameters, replacing the old single long column
+    # where every groupbox was stacked and visible at once.
+    # ------------------------------------------------------------------
+
+    def _build_operation_master_detail(self, operations, tile_width=130, detail_width=280):
+        """operations: [(key, title, builder_fn), ...]. builder_fn(layout)
+        populates a QVBoxLayout with that one operation's own widgets --
+        the exact same groupbox-building code the old flat column used,
+        just placed on its own page here instead of stacked with every
+        other operation's."""
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        # Header: a Settings title + the same Reset affordance the old
+        # flat column had next to "Detection Settings" (on_reset_settings_
+        # chamber rebuilds the whole body from last-saved values, not just
+        # one tile's) -- now sitting above every tile instead of one.
+        header = QHBoxLayout()
+        title = QLabel("Settings")
+        title.setStyleSheet("font-weight: 700; font-size: 11.5px;")
+        header.addWidget(title)
+        header.addStretch()
+        reset_settings_btn = QPushButton("Reset")
+        reset_settings_btn.setObjectName("resetSmallBtn")
+        reset_settings_btn.clicked.connect(self.app.on_reset_settings_chamber)
+        header.addWidget(reset_settings_btn)
+        outer.addLayout(header)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        outer.addLayout(row)
+
+        tile_scroll, tile_col = self._scroll_column(fixed_width=tile_width)
+        stack = QStackedWidget()
+        stack.setFixedWidth(detail_width)
+
+        buttons = {}
+        index_of = {key: i for i, (key, _title, _builder) in enumerate(operations)}
+
+        def activate(key):
+            for k, b in buttons.items():
+                b.setObjectName("analysisCardActive" if k == key else "toolBtn")
+                b.style().unpolish(b)
+                b.style().polish(b)
+            stack.setCurrentIndex(index_of[key])
+
+        for i, (key, tile_title, builder) in enumerate(operations):
+            page_scroll, page_layout = self._scroll_column()
+            builder(page_layout)
+            page_layout.addStretch()
+            stack.addWidget(page_scroll)
+
+            b = QPushButton(tile_title)
+            b.setObjectName("analysisCardActive" if i == 0 else "toolBtn")
+            b.setMinimumHeight(38)
+            b.clicked.connect(lambda checked=False, k=key: activate(k))
+            tile_col.addWidget(b)
+            buttons[key] = b
+        tile_col.addStretch()
+        stack.setCurrentIndex(0)
+
+        row.addWidget(tile_scroll)
+        row.addWidget(stack)
+        return container
+
+    # ------------------------------------------------------------------
     # Standard / Multi-Mouse ("zone") setup body
     # ------------------------------------------------------------------
 
     def _build_zone_body(self, mode):
-        # LEFT: video-related work only (queue, camera/subjects) -- every
-        # tracking/zone/detection setting lives in the RIGHT column instead
-        # (MM asked for the left column kept clear for just the video).
-        left_scroll, left = self._scroll_column(fixed_width=330)
-        self._video_header_row(left)
-        left.addStretch()
+        # LEFT: master-detail settings panel -- MM asked for every setting
+        # that used to sit in the old RIGHT column to move here instead,
+        # organized as "click an operation tile, its own parameters show
+        # in the 2nd column" rather than one long stacked column of every
+        # groupbox visible at once. The video queue (the old LEFT column's
+        # only content) moves to the RIGHT side below to make room.
+        operations = []
 
-        right_scroll, right = self._scroll_column(fixed_width=340)
+        def build_time_zone(layout):
+            time_box = QGroupBox("Time Window & Zone Names")
+            tv = QVBoxLayout(time_box)
+            row1 = QHBoxLayout()
+            row1.addWidget(QLabel("Start (s):"))
+            self.start_entry = QLineEdit(self.app._memory.get("start_entry", ""))
+            self.start_entry.setFixedWidth(60)
+            row1.addWidget(self.start_entry)
+            row1.addWidget(QLabel("End (s):"))
+            self.end_entry = QLineEdit(self.app._memory.get("end_entry", ""))
+            self.end_entry.setFixedWidth(60)
+            row1.addWidget(self.end_entry)
+            row1.addStretch()
+            tv.addLayout(row1)
+            tv.addWidget(QLabel("ROI names (comma-separated):"))
+            self.roi_names_entry = QLineEdit(self.app._memory.get("roi_names_entry", ""))
+            tv.addWidget(self.roi_names_entry)
+            tv.addWidget(_hint("Optional -- or click 'Draw Zones'/'Draw Zone Outline' below and name "
+                                "each zone as you draw it."))
+            tv.addWidget(_hint("Object names (only used if Interaction Tracking is on):"))
+            self.object_names_entry = QLineEdit(self.entry_or_default("object_names_entry", ""))
+            tv.addWidget(self.object_names_entry)
+            tv.addWidget(_hint("Interaction margin, px (0 = must be inside the object; raise to "
+                                "count nearby too):"))
+            self.interaction_margin_entry = QLineEdit(self.entry_or_default("interaction_margin_entry", "20"))
+            self.interaction_margin_entry.setFixedWidth(60)
+            tv.addWidget(self.interaction_margin_entry)
+            layout.addWidget(time_box)
+        operations.append(("time_zone", "Time Window &\nZone Names", build_time_zone))
 
-        time_box = QGroupBox("Time window & zone names")
-        tv = QVBoxLayout(time_box)
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Start (s):"))
-        self.start_entry = QLineEdit(self.app._memory.get("start_entry", ""))
-        self.start_entry.setFixedWidth(60)
-        row1.addWidget(self.start_entry)
-        row1.addWidget(QLabel("End (s):"))
-        self.end_entry = QLineEdit(self.app._memory.get("end_entry", ""))
-        self.end_entry.setFixedWidth(60)
-        row1.addWidget(self.end_entry)
-        row1.addStretch()
-        tv.addLayout(row1)
-        tv.addWidget(QLabel("ROI names (comma-separated):"))
-        self.roi_names_entry = QLineEdit(self.app._memory.get("roi_names_entry", ""))
-        tv.addWidget(self.roi_names_entry)
-        tv.addWidget(_hint("Optional -- or click 'Draw Zones'/'Draw Zone Outline' below and name "
-                            "each zone as you draw it."))
-        tv.addWidget(_hint("Object names (only used if Interaction Tracking is on):"))
-        self.object_names_entry = QLineEdit(self.entry_or_default("object_names_entry", ""))
-        tv.addWidget(self.object_names_entry)
-        tv.addWidget(_hint("Interaction margin, px (0 = must be inside the object; raise to "
-                            "count nearby too):"))
-        self.interaction_margin_entry = QLineEdit(self.entry_or_default("interaction_margin_entry", "20"))
-        self.interaction_margin_entry.setFixedWidth(60)
-        tv.addWidget(self.interaction_margin_entry)
-        right.addWidget(time_box)
+        def build_analysis(layout):
+            analysis_box = QGroupBox("Analysis")
+            av = QVBoxLayout(analysis_box)
+            self.loc_var = QCheckBox("Location Tracking (always on)" if mode == "standard" else "Location Tracking")
+            self.loc_var.setChecked(True if mode == "standard" else self.var_or_default("loc_var", True))
+            if mode == "standard":
+                self.loc_var.setEnabled(False)
+            av.addWidget(self.loc_var)
 
-        analysis_box = QGroupBox("Analysis")
-        av = QVBoxLayout(analysis_box)
-        self.loc_var = QCheckBox("Location Tracking (always on)" if mode == "standard" else "Location Tracking")
-        self.loc_var.setChecked(True if mode == "standard" else self.var_or_default("loc_var", True))
+            self.interact_var = QCheckBox("Interaction Tracking")
+            self.interact_var.setChecked(self.var_or_default("interact_var", False))
+            av.addWidget(self.interact_var)
+            entries_row = QHBoxLayout()
+            self.entries_var = QCheckBox("Arm Entries")
+            self.entries_var.setChecked(self.var_or_default("entries_var", False))
+            entries_row.addWidget(self.entries_var)
+            if mode == "standard":
+                entries_row.addWidget(_info_icon(
+                    "Counts each debounced crossing into a zone, based on the tracked "
+                    "center point (see calculate_arm_entries)."))
+            entries_row.addStretch()
+            av.addLayout(entries_row)
+            self.altern_var = QCheckBox("Arm Alternation")
+            self.altern_var.setChecked(self.var_or_default("altern_var", False))
+            av.addWidget(self.altern_var)
+            sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+            av.addWidget(sep)
+            self.all_var = QCheckBox("All Behaviours")
+            self.all_var.setChecked(self.var_or_default("all_var", False))
+            av.addWidget(self.all_var)
+            layout.addWidget(analysis_box)
+        operations.append(("analysis", "Analysis", build_analysis))
+
         if mode == "standard":
-            self.loc_var.setEnabled(False)
-        av.addWidget(self.loc_var)
+            def build_stop(layout):
+                stop_box = QGroupBox("Stop Condition (optional)")
+                sv = QVBoxLayout(stop_box)
+                sv.addWidget(_hint("Stop early once this is reached. Leave 'None' to just use End (s)."))
+                self.stop_condition_combo = QComboBox()
+                self.stop_condition_combo.addItems([
+                    "None", "N seconds of immobility", "N entries into a zone", "N pixels of total distance",
+                ])
+                self.stop_condition_combo.setCurrentText(self.app._memory.get("stop_condition_var", "None"))
+                sv.addWidget(self.stop_condition_combo)
+                row = QHBoxLayout()
+                row.addWidget(QLabel("Value (s / count / px):"))
+                self.stop_value_entry = QLineEdit(self.entry_or_default("stop_value_entry", ""))
+                self.stop_value_entry.setFixedWidth(70)
+                row.addWidget(self.stop_value_entry)
+                row.addStretch()
+                sv.addLayout(row)
+                row2 = QHBoxLayout()
+                row2.addWidget(QLabel("Zone name (for 'zone entries' only):"))
+                self.stop_zone_entry = QLineEdit(self.entry_or_default("stop_zone_entry", ""))
+                row2.addWidget(self.stop_zone_entry)
+                sv.addLayout(row2)
+                layout.addWidget(stop_box)
+            operations.append(("stop", "Stop Condition", build_stop))
 
-        self.interact_var = QCheckBox("Interaction Tracking")
-        self.interact_var.setChecked(self.var_or_default("interact_var", False))
-        av.addWidget(self.interact_var)
-        entries_row = QHBoxLayout()
-        self.entries_var = QCheckBox("Arm Entries")
-        self.entries_var.setChecked(self.var_or_default("entries_var", False))
-        entries_row.addWidget(self.entries_var)
-        if mode == "standard":
-            entries_row.addWidget(_info_icon(
-                "Counts each debounced crossing into a zone, based on the tracked "
-                "center point (see calculate_arm_entries)."))
-        entries_row.addStretch()
-        av.addLayout(entries_row)
-        self.altern_var = QCheckBox("Arm Alternation")
-        self.altern_var.setChecked(self.var_or_default("altern_var", False))
-        av.addWidget(self.altern_var)
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        av.addWidget(sep)
-        self.all_var = QCheckBox("All Behaviours")
-        self.all_var.setChecked(self.var_or_default("all_var", False))
-        av.addWidget(self.all_var)
-        right.addWidget(analysis_box)
+            def build_zone_assoc(layout):
+                zone_assoc_box = QGroupBox("Zone Associations (optional)")
+                zav = QVBoxLayout(zone_assoc_box)
+                zav.addWidget(_hint(
+                    "Combine 2+ zones into one named zone for reporting -- "
+                    "'Group = Zone + Zone', separated by ';'."
+                ))
+                self.zone_associations_entry = QLineEdit(self.entry_or_default("zone_associations_entry", ""))
+                self.zone_associations_entry.setPlaceholderText(
+                    "Left Side = Left Arm + Left Corner; Right Side = Right Arm + Right Corner"
+                )
+                zav.addWidget(self.zone_associations_entry)
+                layout.addWidget(zone_assoc_box)
+            operations.append(("zone_assoc", "Zone\nAssociations", build_zone_assoc))
 
-        if mode == "standard":
-            stop_box = QGroupBox("Stop condition (optional)")
-            sv = QVBoxLayout(stop_box)
-            sv.addWidget(_hint("Stop early once this is reached. Leave 'None' to just use End (s)."))
-            self.stop_condition_combo = QComboBox()
-            self.stop_condition_combo.addItems([
-                "None", "N seconds of immobility", "N entries into a zone", "N pixels of total distance",
-            ])
-            self.stop_condition_combo.setCurrentText(self.app._memory.get("stop_condition_var", "None"))
-            sv.addWidget(self.stop_condition_combo)
-            row = QHBoxLayout()
-            row.addWidget(QLabel("Value (s / count / px):"))
-            self.stop_value_entry = QLineEdit(self.entry_or_default("stop_value_entry", ""))
-            self.stop_value_entry.setFixedWidth(70)
-            row.addWidget(self.stop_value_entry)
-            row.addStretch()
-            sv.addLayout(row)
-            row2 = QHBoxLayout()
-            row2.addWidget(QLabel("Zone name (for 'zone entries' only):"))
-            self.stop_zone_entry = QLineEdit(self.entry_or_default("stop_zone_entry", ""))
-            row2.addWidget(self.stop_zone_entry)
-            sv.addLayout(row2)
-            right.addWidget(stop_box)
+            def build_zone_formula(layout):
+                zone_formula_box = QGroupBox("Zone Formula (optional)")
+                zfv = QVBoxLayout(zone_formula_box)
+                zfv.addWidget(_hint(
+                    "For zones from 'Draw Zone Outline' (auto-detected arms/zones A, B, C, ...): "
+                    "name them here -- 'A = Center', 'B+C = Left Arm', separated by ';'."
+                ))
+                self.zone_formula_entry = QLineEdit(self.entry_or_default("zone_formula_entry", ""))
+                self.zone_formula_entry.setPlaceholderText("A = Center; B+C = Left Arm")
+                zfv.addWidget(self.zone_formula_entry)
+                layout.addWidget(zone_formula_box)
+            operations.append(("zone_formula", "Zone Formula", build_zone_formula))
 
-            zone_assoc_box = QGroupBox("Zone Associations (optional)")
-            zav = QVBoxLayout(zone_assoc_box)
-            zav.addWidget(_hint(
-                "Combine 2+ zones into one named zone for reporting -- "
-                "'Group = Zone + Zone', separated by ';'."
-            ))
-            self.zone_associations_entry = QLineEdit(self.entry_or_default("zone_associations_entry", ""))
-            self.zone_associations_entry.setPlaceholderText(
-                "Left Side = Left Arm + Left Corner; Right Side = Right Arm + Right Corner"
-            )
-            zav.addWidget(self.zone_associations_entry)
-            right.addWidget(zone_assoc_box)
+            def build_smoothing(layout):
+                smooth_box = QGroupBox("Trajectory Smoothing (optional)")
+                smv = QVBoxLayout(smooth_box)
+                self.smooth_trajectory_var = QCheckBox("Smooth the trajectory before the charts")
+                self.smooth_trajectory_var.setChecked(self.var_or_default("smooth_trajectory_var", False))
+                smv.addWidget(self.smooth_trajectory_var)
+                smv.addWidget(_hint(
+                    "Filters out single-frame noise before the Trajectory/Heatmap charts. "
+                    "raw_tracking.csv still keeps the unfiltered positions too."
+                ))
+                srow = QHBoxLayout()
+                srow.addWidget(QLabel("Window (frames):"))
+                self.smooth_window_entry = QLineEdit(self.entry_or_default("smooth_window_entry", "5"))
+                self.smooth_window_entry.setFixedWidth(50)
+                srow.addWidget(self.smooth_window_entry)
+                srow.addStretch()
+                smv.addLayout(srow)
+                layout.addWidget(smooth_box)
+            operations.append(("smoothing", "Trajectory\nSmoothing", build_smoothing))
 
-            zone_formula_box = QGroupBox("Zone Formula (optional)")
-            zfv = QVBoxLayout(zone_formula_box)
-            zfv.addWidget(_hint(
-                "For zones from 'Draw Zone Outline' (auto-detected arms/zones A, B, C, ...): "
-                "name them here -- 'A = Center', 'B+C = Left Arm', separated by ';'."
-            ))
-            self.zone_formula_entry = QLineEdit(self.entry_or_default("zone_formula_entry", ""))
-            self.zone_formula_entry.setPlaceholderText("A = Center; B+C = Left Arm")
-            zfv.addWidget(self.zone_formula_entry)
-            right.addWidget(zone_formula_box)
+            def build_custom_vars(layout):
+                custom_vars_box = QGroupBox("Custom Variables (optional)")
+                cvv = QVBoxLayout(custom_vars_box)
+                cvv.addWidget(_hint(
+                    "Add derived column(s) computed from the tracked columns. One "
+                    "'name = expression' per line; a later line can use a name from above it. "
+                    "Arithmetic, comparisons and a few math functions only -- no arbitrary code."
+                ))
+                self.custom_variables_entry = QPlainTextEdit(self.app._memory.get("custom_variables_var", ""))
+                self.custom_variables_entry.setPlaceholderText(
+                    "distance_cm = Distance_pixels / scale_factor\nspeed_cm_s = distance_cm * FPS"
+                )
+                self.custom_variables_entry.setFixedHeight(64)
+                cvv.addWidget(self.custom_variables_entry)
+                layout.addWidget(custom_vars_box)
+            operations.append(("custom_vars", "Custom\nVariables", build_custom_vars))
 
-            smooth_box = QGroupBox("Trajectory smoothing (optional)")
-            smv = QVBoxLayout(smooth_box)
-            self.smooth_trajectory_var = QCheckBox("Smooth the trajectory before the charts")
-            self.smooth_trajectory_var.setChecked(self.var_or_default("smooth_trajectory_var", False))
-            smv.addWidget(self.smooth_trajectory_var)
-            smv.addWidget(_hint(
-                "Filters out single-frame noise before the Trajectory/Heatmap charts. "
-                "raw_tracking.csv still keeps the unfiltered positions too."
-            ))
-            srow = QHBoxLayout()
-            srow.addWidget(QLabel("Window (frames):"))
-            self.smooth_window_entry = QLineEdit(self.entry_or_default("smooth_window_entry", "5"))
-            self.smooth_window_entry.setFixedWidth(50)
-            srow.addWidget(self.smooth_window_entry)
-            srow.addStretch()
-            smv.addLayout(srow)
-            right.addWidget(smooth_box)
+        def build_animals(layout):
+            self._animals_row(layout, mode)
+        operations.append(("animals", "Animals in\nFrame", build_animals))
 
-            custom_vars_box = QGroupBox("Custom Variables (optional)")
-            cvv = QVBoxLayout(custom_vars_box)
-            cvv.addWidget(_hint(
-                "Add derived column(s) computed from the tracked columns. One "
-                "'name = expression' per line; a later line can use a name from above it. "
-                "Arithmetic, comparisons and a few math functions only -- no arbitrary code."
-            ))
-            self.custom_variables_entry = QPlainTextEdit(self.app._memory.get("custom_variables_var", ""))
-            self.custom_variables_entry.setPlaceholderText(
-                "distance_cm = Distance_pixels / scale_factor\nspeed_cm_s = distance_cm * FPS"
-            )
-            self.custom_variables_entry.setFixedHeight(64)
-            cvv.addWidget(self.custom_variables_entry)
-            right.addWidget(custom_vars_box)
+        def build_detection(layout):
+            self._detection_settings_box(layout, mode)
+        operations.append(("detection", "Detection\nSettings", build_detection))
 
-        self._animals_row(right, mode)
+        def build_time_bins(layout):
+            self._time_bins_box(layout)
+        operations.append(("time_bins", "Time Bins", build_time_bins))
+
+        master_detail = self._build_operation_master_detail(operations)
+        self.body_layout.addWidget(master_detail)
 
         # ---- CENTER: preview canvas + toolbar ----
         center = QVBoxLayout()
@@ -970,21 +1098,13 @@ class SetupPage(QWidget):
         self.canvas = PreviewCanvas(self.app)
         center.addWidget(self.canvas, 1)
 
-        # ---- RIGHT (continued): Detection Settings, at the bottom of the
-        # same settings column everything else above was added to ----
-        right_hdr = QHBoxLayout()
-        right_hdr.addWidget(QLabel("Detection Settings"))
-        right_hdr.addStretch()
-        reset_settings_btn = QPushButton("Reset")
-        reset_settings_btn.setObjectName("resetSmallBtn")
-        reset_settings_btn.clicked.connect(self.app.on_reset_settings_chamber)
-        right_hdr.addWidget(reset_settings_btn)
-        right.addLayout(right_hdr)
-        self._detection_settings(right, mode)
-        right.addStretch()
-
-        self.body_layout.addWidget(left_scroll)
         self.body_layout.addLayout(center, 1)
+
+        # ---- RIGHT: video queue (moved here from the old LEFT column so
+        # the settings master-detail panel above could take its place) ----
+        right_scroll, right = self._scroll_column(fixed_width=300)
+        self._video_header_row(right)
+        right.addStretch()
         self.body_layout.addWidget(right_scroll)
 
         # ---- BOTTOM: start + progress ----
@@ -1016,23 +1136,27 @@ class SetupPage(QWidget):
     # ------------------------------------------------------------------
 
     def _build_behavior_body(self):
-        left_scroll, left = self._scroll_column(fixed_width=330)
-        self._video_header_row(left)
+        # LEFT: master-detail settings panel, same layout MM asked for in
+        # the zone bodies above -- "Ella behaviour application num" (every
+        # analysis type) means this one too.
+        operations = []
 
-        time_box = QGroupBox("Time window")
-        tv = QVBoxLayout(time_box)
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Start (s):"))
-        self.start_entry = QLineEdit(self.app._memory.get("start_entry", ""))
-        self.start_entry.setFixedWidth(60)
-        row1.addWidget(self.start_entry)
-        row1.addWidget(QLabel("End (s):"))
-        self.end_entry = QLineEdit(self.app._memory.get("end_entry", ""))
-        self.end_entry.setFixedWidth(60)
-        row1.addWidget(self.end_entry)
-        row1.addStretch()
-        tv.addLayout(row1)
-        left.addWidget(time_box)
+        def build_time(layout):
+            time_box = QGroupBox("Time Window")
+            tv = QVBoxLayout(time_box)
+            row1 = QHBoxLayout()
+            row1.addWidget(QLabel("Start (s):"))
+            self.start_entry = QLineEdit(self.app._memory.get("start_entry", ""))
+            self.start_entry.setFixedWidth(60)
+            row1.addWidget(self.start_entry)
+            row1.addWidget(QLabel("End (s):"))
+            self.end_entry = QLineEdit(self.app._memory.get("end_entry", ""))
+            self.end_entry.setFixedWidth(60)
+            row1.addWidget(self.end_entry)
+            row1.addStretch()
+            tv.addLayout(row1)
+            layout.addWidget(time_box)
+        operations.append(("time", "Time Window", build_time))
 
         # Not used by this mode, but on_start()/_build_setup reference
         # these names generically -- harmless empty stand-ins.
@@ -1044,29 +1168,64 @@ class SetupPage(QWidget):
         self.altern_var = QCheckBox(); self.altern_var.setChecked(False)
         self.all_var = QCheckBox(); self.all_var.setChecked(False)
 
-        beh_box = QGroupBox("Behaviors to detect")
-        bv = QVBoxLayout(beh_box)
-        self.behavior_rearing_var = QCheckBox("Rearing")
-        self.behavior_rearing_var.setChecked(self.var_or_default("behavior_rearing_var", True))
-        self.behavior_grooming_var = QCheckBox("Grooming")
-        self.behavior_grooming_var.setChecked(self.var_or_default("behavior_grooming_var", True))
-        self.behavior_locomotion_var = QCheckBox("Locomotion")
-        self.behavior_locomotion_var.setChecked(self.var_or_default("behavior_locomotion_var", False))
-        self.behavior_immobile_var = QCheckBox("Immobile")
-        self.behavior_immobile_var.setChecked(self.var_or_default("behavior_immobile_var", False))
-        for w in (self.behavior_rearing_var, self.behavior_grooming_var,
-                  self.behavior_locomotion_var, self.behavior_immobile_var):
-            bv.addWidget(w)
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        bv.addWidget(sep)
-        self.behavior_all_var = QCheckBox("All")
-        self.behavior_all_var.setChecked(self.var_or_default("behavior_all_var", False))
-        self.behavior_all_var.toggled.connect(self._on_behavior_all_toggle)
-        bv.addWidget(self.behavior_all_var)
-        left.addWidget(beh_box)
+        def build_behaviors(layout):
+            beh_box = QGroupBox("Behaviors to Detect")
+            bv = QVBoxLayout(beh_box)
+            self.behavior_rearing_var = QCheckBox("Rearing")
+            self.behavior_rearing_var.setChecked(self.var_or_default("behavior_rearing_var", True))
+            self.behavior_grooming_var = QCheckBox("Grooming")
+            self.behavior_grooming_var.setChecked(self.var_or_default("behavior_grooming_var", True))
+            self.behavior_locomotion_var = QCheckBox("Locomotion")
+            self.behavior_locomotion_var.setChecked(self.var_or_default("behavior_locomotion_var", False))
+            self.behavior_immobile_var = QCheckBox("Immobile")
+            self.behavior_immobile_var.setChecked(self.var_or_default("behavior_immobile_var", False))
+            for w in (self.behavior_rearing_var, self.behavior_grooming_var,
+                      self.behavior_locomotion_var, self.behavior_immobile_var):
+                bv.addWidget(w)
+            sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+            bv.addWidget(sep)
+            self.behavior_all_var = QCheckBox("All")
+            self.behavior_all_var.setChecked(self.var_or_default("behavior_all_var", False))
+            self.behavior_all_var.toggled.connect(self._on_behavior_all_toggle)
+            bv.addWidget(self.behavior_all_var)
+            layout.addWidget(beh_box)
+        operations.append(("behaviors", "Behaviors to\nDetect", build_behaviors))
 
-        self._animals_row(left, "behavior")
-        left.addStretch()
+        def build_animals(layout):
+            self._animals_row(layout, "behavior")
+        operations.append(("animals", "Animals in\nFrame", build_animals))
+
+        def build_detection(layout):
+            self._detection_settings_box(layout, "behavior")
+        operations.append(("detection", "Detection\nSettings", build_detection))
+
+        def build_time_bins(layout):
+            self._time_bins_box(layout)
+        operations.append(("time_bins", "Time Bins", build_time_bins))
+
+        def build_beh_thresholds(layout):
+            beh_settings = QGroupBox("Behavior Classification Thresholds")
+            bsv = QVBoxLayout(beh_settings)
+            bsv.addWidget(_hint("Each frame gets a pseudo-pose (nose/paws/tail) from the detected "
+                                 "silhouette, then grooming/rearing/locomotion are scored from "
+                                 "several combined cues, not one threshold."))
+            self._setting_field(bsv, "Locomotion speed threshold (px/s)", "loco_thresh_entry", 30)
+            self._setting_field(bsv, "Rearing sensitivity 0-1 (lower = more sensitive)", "rear_thresh_entry", 0.25)
+            self._setting_field(bsv, "Grooming sensitivity 0-1 (lower = more sensitive)", "groom_thresh_entry", 0.50)
+            self._setting_field(bsv, "Frames to confirm a behavior (persistence)", "immobile_thresh_entry", 6)
+            self._setting_field(bsv, "Min bout duration (s)", "min_bout_entry", 0.3)
+            bsv.addWidget(_hint("Grooming is the hardest of these to detect without a trained pose "
+                                 "model -- treat it as a starting point to validate by eye, not "
+                                 "ground truth."))
+            layout.addWidget(beh_settings)
+        operations.append(("beh_thresholds", "Behavior\nThresholds", build_beh_thresholds))
+
+        def build_ml_panel(layout):
+            self._build_ml_classifier_panel(layout)
+        operations.append(("ml_classifier", "ML Classifier", build_ml_panel))
+
+        master_detail = self._build_operation_master_detail(operations)
+        self.body_layout.addWidget(master_detail)
 
         # ---- CENTER ----
         center = QVBoxLayout()
@@ -1098,42 +1257,12 @@ class SetupPage(QWidget):
         self.canvas = PreviewCanvas(self.app)
         center.addWidget(self.canvas, 1)
 
-        # ---- RIGHT ----
-        right_scroll, right = self._scroll_column(fixed_width=320)
-        right_hdr = QHBoxLayout()
-        right_hdr.addWidget(QLabel("Detection Settings"))
-        right_hdr.addStretch()
-        reset_settings_btn = QPushButton("Reset")
-        reset_settings_btn.setObjectName("resetSmallBtn")
-        reset_settings_btn.clicked.connect(self.app.on_reset_settings_chamber)
-        right_hdr.addWidget(reset_settings_btn)
-        right.addLayout(right_hdr)
-        self._detection_settings(right, "behavior")
-
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
-        right.addWidget(sep2)
-        beh_settings = QGroupBox("Behavior Classification thresholds")
-        bsv = QVBoxLayout(beh_settings)
-        bsv.addWidget(_hint("Each frame gets a pseudo-pose (nose/paws/tail) from the detected "
-                             "silhouette, then grooming/rearing/locomotion are scored from "
-                             "several combined cues, not one threshold."))
-        self._setting_field(bsv, "Locomotion speed threshold (px/s)", "loco_thresh_entry", 30)
-        self._setting_field(bsv, "Rearing sensitivity 0-1 (lower = more sensitive)", "rear_thresh_entry", 0.25)
-        self._setting_field(bsv, "Grooming sensitivity 0-1 (lower = more sensitive)", "groom_thresh_entry", 0.50)
-        self._setting_field(bsv, "Frames to confirm a behavior (persistence)", "immobile_thresh_entry", 6)
-        self._setting_field(bsv, "Min bout duration (s)", "min_bout_entry", 0.3)
-        bsv.addWidget(_hint("Grooming is the hardest of these to detect without a trained pose "
-                             "model -- treat it as a starting point to validate by eye, not "
-                             "ground truth."))
-        right.addWidget(beh_settings)
-
-        sep3 = QFrame(); sep3.setFrameShape(QFrame.HLine)
-        right.addWidget(sep3)
-        self._build_ml_classifier_panel(right)
-        right.addStretch()
-
-        self.body_layout.addWidget(left_scroll)
         self.body_layout.addLayout(center, 1)
+
+        # ---- RIGHT: video queue (moved here from the old LEFT column) ----
+        right_scroll, right = self._scroll_column(fixed_width=300)
+        self._video_header_row(right)
+        right.addStretch()
         self.body_layout.addWidget(right_scroll)
 
         # ---- BOTTOM ----
