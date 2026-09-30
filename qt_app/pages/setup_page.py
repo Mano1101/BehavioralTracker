@@ -791,7 +791,7 @@ class SetupPage(QWidget):
     # where every groupbox was stacked and visible at once.
     # ------------------------------------------------------------------
 
-    def _build_operation_master_detail(self, operations, tile_width=130, detail_width=280):
+    def _build_operation_master_detail(self, operations, tile_width=250, detail_width=390):
         """operations: [(key, title, builder_fn), ...]. builder_fn(layout)
         populates a QVBoxLayout with that one operation's own widgets --
         the exact same groupbox-building code the old flat column used,
@@ -817,6 +817,11 @@ class SetupPage(QWidget):
         header.addWidget(reset_settings_btn)
         outer.addLayout(header)
 
+        # Video queue: lives at the TOP of this same Settings area (per
+        # MM's request -- not a separate column of its own), above the
+        # operation tiles/detail pane below.
+        self._video_header_row(outer)
+
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
@@ -831,7 +836,7 @@ class SetupPage(QWidget):
 
         def activate(key):
             for k, b in buttons.items():
-                b.setObjectName("analysisCardActive" if k == key else "toolBtn")
+                b.setObjectName("navTileActive" if k == key else "navTile")
                 b.style().unpolish(b)
                 b.style().polish(b)
             stack.setCurrentIndex(index_of[key])
@@ -842,14 +847,17 @@ class SetupPage(QWidget):
             page_layout.addStretch()
             stack.addWidget(page_scroll)
 
-            b = QPushButton(tile_title)
-            b.setObjectName("analysisCardActive" if i == 0 else "toolBtn")
-            b.setMinimumHeight(38)
+            b = QPushButton(tile_title.replace("\n", " "))
+            b.setObjectName("navTile")
+            b.setMinimumHeight(42)
+            b.setMinimumWidth(tile_width - 30)
+            b.setStyleSheet("text-align: left; padding-left: 12px;")
             b.clicked.connect(lambda checked=False, k=key: activate(k))
             tile_col.addWidget(b)
             buttons[key] = b
         tile_col.addStretch()
-        stack.setCurrentIndex(0)
+        initial_key = "detection" if "detection" in index_of else operations[0][0]
+        activate(initial_key)
 
         row.addWidget(tile_scroll)
         row.addWidget(stack)
@@ -860,12 +868,13 @@ class SetupPage(QWidget):
     # ------------------------------------------------------------------
 
     def _build_zone_body(self, mode):
-        # LEFT: master-detail settings panel -- MM asked for every setting
-        # that used to sit in the old RIGHT column to move here instead,
+        # Settings master-detail panel -- MM asked for every setting that
+        # used to sit in one long stacked column to move here instead,
         # organized as "click an operation tile, its own parameters show
-        # in the 2nd column" rather than one long stacked column of every
-        # groupbox visible at once. The video queue (the old LEFT column's
-        # only content) moves to the RIGHT side below to make room.
+        # in the 2nd column". The video queue lives at the TOP of this
+        # same Settings area (see _build_operation_master_detail) -- it
+        # was briefly its own column (right, then left) before MM asked
+        # for it to just sit inside the Settings area instead.
         operations = []
 
         def build_time_zone(layout):
@@ -1100,13 +1109,6 @@ class SetupPage(QWidget):
 
         self.body_layout.addLayout(center, 1)
 
-        # ---- RIGHT: video queue (moved here from the old LEFT column so
-        # the settings master-detail panel above could take its place) ----
-        right_scroll, right = self._scroll_column(fixed_width=300)
-        self._video_header_row(right)
-        right.addStretch()
-        self.body_layout.addWidget(right_scroll)
-
         # ---- BOTTOM: start + progress ----
         left_cta = QVBoxLayout()
         ready = QLabel("Ready to begin analysis")
@@ -1126,8 +1128,8 @@ class SetupPage(QWidget):
         self.app.progress_label.setStyleSheet(f"color: {PALETTE['MUTED']}; font-size: 9.5px;")
         progress_col.addWidget(self.app.progress_label)
 
+        self.bottom_layout.addLayout(progress_col, 3)
         self.bottom_layout.addLayout(left_cta, 1)
-        self.bottom_layout.addLayout(progress_col, 1)
 
         self.refresh_canvas()
 
@@ -1259,12 +1261,6 @@ class SetupPage(QWidget):
 
         self.body_layout.addLayout(center, 1)
 
-        # ---- RIGHT: video queue (moved here from the old LEFT column) ----
-        right_scroll, right = self._scroll_column(fixed_width=300)
-        self._video_header_row(right)
-        right.addStretch()
-        self.body_layout.addWidget(right_scroll)
-
         # ---- BOTTOM ----
         left_cta = QVBoxLayout()
         ready = QLabel("Ready to begin behavior classification")
@@ -1294,8 +1290,8 @@ class SetupPage(QWidget):
         self.app.progress_label.setStyleSheet(f"color: {PALETTE['MUTED']}; font-size: 9.5px;")
         progress_col.addWidget(self.app.progress_label)
 
-        self.bottom_layout.addLayout(left_cta, 2)
         self.bottom_layout.addLayout(progress_col, 1)
+        self.bottom_layout.addLayout(left_cta, 2)
 
         self.refresh_canvas()
 
