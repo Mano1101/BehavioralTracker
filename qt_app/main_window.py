@@ -253,14 +253,14 @@ class MainWindow(QMainWindow):
         brand_row.setSpacing(10)
         badge = QLabel("B")
         badge.setObjectName("brandBadge")
-        badge.setFixedSize(36, 36)
+        badge.setFixedSize(52, 52)
         badge.setAlignment(Qt.AlignCenter)
         if os.path.exists(ICON_PATH):
             # The icon file already has its own rounded gradient background
             # baked in, so fill the badge with it directly instead of
             # layering it on top of the QSS accent-colored square.
             pix = QPixmap(ICON_PATH).scaled(
-                36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                52, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             badge.setPixmap(pix)
             badge.setStyleSheet("background: transparent; border-radius: 6px;")
         brand_row.addWidget(badge)
@@ -345,7 +345,7 @@ class MainWindow(QMainWindow):
         self.analysis_type_buttons = {}
         at_defs = [
             ("standard", "Standard Tracking", "Single mouse - zones & distance"),
-            ("multi_mouse", "Multi-Mouse Tracking", "2-3 mice, ID-matched tracks"),
+            ("multi_mouse", "Multi-Mouse", "2-3 mice, ID-matched tracks"),
             ("behavior", "Behavior Classification", "Grooming / rearing / locomotion"),
         ]
         for val, text, subtitle in at_defs:
