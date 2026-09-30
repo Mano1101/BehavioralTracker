@@ -820,14 +820,29 @@ def draw_mask_polygons(display, mask_polygons, color=(0, 0, 0)):
     cv2.addWeighted(overlay, 0.35, display, 0.65, 0, dst=display)
 
 
-def build_exclusion_mask(shape_hw, mask_polygons):
+def build_exclusion_mask(shape_hw, mask_polygons, zone_polygons=None, mask_outside_zones=False):
     """Boolean array, True where pixels should be excluded from detection
-    entirely (e.g. a food hopper, cage wire, reflection)."""
+    entirely (e.g. a food hopper, cage wire, reflection).
+
+    zone_polygons/mask_outside_zones add the "auto-mask everything outside
+    my zones" setting: once the zones are drawn/finalized, MM wants
+    everything OUTSIDE them excluded automatically, on top of whatever
+    Mask Zone shapes were drawn by hand -- so a stray reflection or a
+    passing shadow just outside the maze can never be mistaken for the
+    animal. This is a no-op unless BOTH mask_outside_zones is True AND
+    zone_polygons is non-empty (no zones yet == nothing to mask outside
+    of), so it never blanks the whole frame by accident."""
     h, w = shape_hw
     mask = np.zeros((h, w), dtype=np.uint8)
     for pts in mask_polygons:
         if len(pts) >= 3:
             cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 255)
+    if mask_outside_zones and zone_polygons:
+        outside = np.full((h, w), 255, dtype=np.uint8)
+        for pts in zone_polygons:
+            if len(pts) >= 3:
+                cv2.fillPoly(outside, [np.array(pts, dtype=np.int32)], 0)
+        mask = np.maximum(mask, outside)
     return mask > 0
 
 
@@ -1350,7 +1365,19 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
     behavior_names = setup.get("behavior_names", [])
 
     mask_polygons = setup.get("mask_points", [])
-    exclusion_mask = build_exclusion_mask((warp_h, warp_w), mask_polygons) if mask_polygons else None
+    # Auto-mask everything outside my zones (optional, on by default) --
+    # once zones are drawn/finalized (roi_points non-empty), anything
+    # outside their union is excluded from detection too, same pipeline
+    # as a hand-drawn Mask Zone shape. See build_exclusion_mask's
+    # docstring: a no-op when there are no zones yet.
+    auto_mask_outside_zones = bool(setup.get("auto_mask_outside_zones")) and bool(roi_points)
+    zone_polygons = list(roi_points.values()) if auto_mask_outside_zones else None
+    exclusion_mask = None
+    if mask_polygons or auto_mask_outside_zones:
+        exclusion_mask = build_exclusion_mask(
+            (warp_h, warp_w), mask_polygons,
+            zone_polygons=zone_polygons, mask_outside_zones=auto_mask_outside_zones,
+        )
 
     threshold = setup["threshold"]
     min_area = setup["min_area"]
