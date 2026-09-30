@@ -7,6 +7,12 @@ trained deep-learning model), manual behavior scoring, maze/arena templates,
 and batch processing (all three analysis types). No pose estimation, no
 manual per-frame animal selection.
 
+The Qt setup screen uses a three-part workspace: analysis-type tabs across
+the top, a settings-category navigator with a detail panel on the left, and
+the interactive video preview and arena tools on the right. The application
+icon is shown in the header. Existing tracking, behavior-scoring, cropping,
+masking, zone-drawing, batch, and results features remain available.
+
 Also includes a set of features brought in from EthoVision XT and SMART
 3.0 (see "Upgrade Plan" in the roadmap below): configurable stop
 conditions, a Subject Database with real experimental metadata, Zone
@@ -121,7 +127,14 @@ it differs by machine (CPU-only vs. GPU/CUDA).
 
 ## Run
 
+On Windows, double-click `run_windows.bat` to create a local virtual
+environment, install the required packages, and launch the app. Python 3.10+
+and the Python launcher (`py`) must be installed first.
+
+For a manual install:
+
 ```
+pip install -r requirements.txt
 python main.py
 ```
 
