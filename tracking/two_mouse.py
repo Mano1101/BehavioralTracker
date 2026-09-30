@@ -21,9 +21,26 @@ tracking tools like Tracktor):
   3. IDENTIFY - blob position alone doesn't tell you WHICH mouse is which
                 from frame to frame. We solve that with the Hungarian
                 algorithm (scipy.optimize.linear_sum_assignment): match this
-                frame's two centroids to last frame's two centroids so that
-                total movement is minimized. This is what keeps "mouse_A"
-                referring to the same physical animal across the video.
+                frame's centroids against each mouse's PREDICTED position
+                (not just its raw last-seen spot) so that total movement is
+                minimized. This is what keeps "mouse_A" referring to the
+                same physical animal across the video.
+
+                The prediction comes from a small constant-velocity Kalman
+                filter per animal (CentroidKalman, below) -- the same core
+                idea AlphaTracker's own PoseFlow/utils_kalman.py uses to
+                track multi-animal identity through occlusion (there, per
+                pose-keypoint with the `filterpy` package; here, per
+                centroid, hand-rolled to keep this file's "no extra heavy
+                deps" design). It buys two things over matching against a
+                raw last-seen position: (a) during a brief occlusion/merge
+                (status="lost"/"partial"), the estimate keeps moving along
+                each animal's last known velocity instead of freezing in
+                place, so re-identification on reappearance has a far
+                better anchor to match against; and (b) the reported
+                trail itself comes out smoother, since a Kalman update
+                blends the noisy raw detection with the motion model
+                rather than reporting it raw.
 
 LIMITATION (be aware of this - it applies to any unmarked tracker, not just
 this script): if the two mice are IDENTICAL in appearance, identity can only
@@ -93,6 +110,28 @@ DEFAULTS = dict(
     debris_motion_pixel_threshold=12,  # per-pixel intensity change to count as "moved"
     debris_motion_fraction=0.02,   # min fraction of a blob's own pixels that must have
                                     # moved at some point in the window to count as alive
+    kalman_process_var=4.0,      # px^2/frame^2, how much each animal's velocity is
+                                    # allowed to drift frame-to-frame -- higher = the
+                                    # predicted position trusts/follows recent motion more
+                                    # eagerly (more responsive to real turns, but also to
+                                    # detection noise); lower = smoother/steadier but slower
+                                    # to react to a genuine direction change. See
+                                    # CentroidKalman.
+    kalman_measurement_var=25.0,   # px^2, how noisy a raw detected centroid is assumed to
+                                    # be (e.g. from the k-means split during a blob merge).
+                                    # Higher = trust the motion-model prediction more than
+                                    # this frame's raw detection when blending the two.
+    kalman_max_coast_frames=15,     # after this many CONSECUTIVE frames with no real
+                                    # detection for a given animal, stop extrapolating its
+                                    # position along its last known velocity and just hold
+                                    # steady instead -- a real mouse doesn't move in a
+                                    # straight line forever, so unbounded extrapolation
+                                    # through a long occlusion (it stopped, turned around,
+                                    # etc.) would drift further from the truth the longer it
+                                    # coasts, not closer. Short gaps (a quick pass-through/
+                                    # merge) stay within this window, so they still benefit
+                                    # from motion-aware prediction; only occlusions longer
+                                    # than this degrade to the old "freeze in place" behavior.
 )
 
 
@@ -359,21 +398,100 @@ def get_centroids(mask, min_area, max_area, num_animals=2, motion_mask=None, deb
 
 
 # --------------------------------------------------------------------------
-# STAGE 3: IDENTIFY (Hungarian algorithm)
+# STAGE 3: IDENTIFY (Hungarian algorithm + per-animal Kalman prediction)
 # --------------------------------------------------------------------------
 
-def match_identities(prev_centroids, curr_centroids):
-    """Reorder curr_centroids to best match prev_centroids' identities by
-    minimizing total displacement (Hungarian / linear sum assignment)."""
+def _hungarian_assignment(prev_centroids, curr_centroids):
+    """Core of match_identities: Hungarian-match curr_centroids against
+    prev_centroids by minimizing total displacement. Returns (ordered,
+    matched) where `ordered` is curr_centroids reordered/held to line up
+    with prev_centroids' identities (exactly match_identities' own
+    contract), and `matched` is the set of prev-indices that actually got
+    paired with a real detection this round -- the rest fell back to
+    holding their prev_centroids value, same as match_identities, but the
+    caller needs to know WHICH indices those were (e.g. to decide which
+    per-animal Kalman filter should absorb a real measurement this frame
+    vs. just coast on its prediction)."""
     cost = np.zeros((len(prev_centroids), len(curr_centroids)))
     for i, p in enumerate(prev_centroids):
         for j, c in enumerate(curr_centroids):
             cost[i, j] = np.hypot(p[0] - c[0], p[1] - c[1])
     row_ind, col_ind = linear_sum_assignment(cost)
     ordered = list(prev_centroids)  # fallback: hold last position if unmatched
+    matched = set()
     for r, c in zip(row_ind, col_ind):
         ordered[r] = curr_centroids[c]
+        matched.add(r)
+    return ordered, matched
+
+
+def match_identities(prev_centroids, curr_centroids):
+    """Reorder curr_centroids to best match prev_centroids' identities by
+    minimizing total displacement (Hungarian / linear sum assignment)."""
+    ordered, _matched = _hungarian_assignment(prev_centroids, curr_centroids)
     return ordered
+
+
+class CentroidKalman:
+    """A minimal constant-velocity Kalman filter tracking ONE animal's
+    (x, y) position + velocity, run independently per axis. Same core
+    per-axis constant-velocity design as AlphaTracker's own
+    PoseFlow/utils_kalman.py pos_vel_filter() -- ported here from N pose
+    keypoints (which needs the `filterpy` package) down to a single
+    centroid, hand-rolled with plain 2x2 numpy matrices instead, to keep
+    this tracker's "no extra heavy deps" design (see module docstring).
+
+    Usage each frame, per animal:
+        x_pred, y_pred = kf.predict()   # ALWAYS -- advances the estimate
+                                         # along the last known velocity,
+                                         # occlusion or not
+        kf.update(x_meas, y_meas)       # ONLY when a real detection was
+                                         # matched to this animal this
+                                         # frame; skip it otherwise and the
+                                         # prediction stands as-is
+
+    predict() must be called before update() each frame (matches this
+    file's own main loop: predict first to get this frame's expected
+    position for Hungarian matching, THEN update whichever animals a real
+    detection was actually matched to)."""
+
+    def __init__(self, x, y, process_var=4.0, measurement_var=25.0):
+        self.pos = np.array([float(x), float(y)])
+        self.vel = np.array([0.0, 0.0])
+        # One 2x2 state covariance per axis: [[var_pos, cov], [cov, var_vel]].
+        # Start confident in position (we're seeded from a real detection)
+        # and deliberately unsure about velocity (no motion history yet).
+        self._P = [np.array([[1.0, 0.0], [0.0, 50.0]]) for _ in range(2)]
+        self._process_var = process_var
+        self._measurement_var = measurement_var
+
+    def predict(self):
+        """Advance the estimate by one frame (dt=1) under the constant-
+        velocity model alone, with no new measurement. Returns the
+        predicted (x, y). Safe/expected to call every frame regardless of
+        whether a detection exists that frame -- see class docstring."""
+        F = np.array([[1.0, 1.0], [0.0, 1.0]])  # dt = 1 frame
+        Q = np.array([[0.0, 0.0], [0.0, self._process_var]])  # process noise on velocity
+        for axis in range(2):
+            state = F @ np.array([self.pos[axis], self.vel[axis]])
+            self._P[axis] = F @ self._P[axis] @ F.T + Q
+            self.pos[axis], self.vel[axis] = state
+        return float(self.pos[0]), float(self.pos[1])
+
+    def update(self, x, y):
+        """Fold in a real measurement (x, y), blending it with the
+        current (already-predicted) estimate by their relative
+        uncertainties. Call once per frame, AFTER predict()."""
+        H = np.array([1.0, 0.0])
+        for axis, z in enumerate((x, y)):
+            P = self._P[axis]
+            S = float(H @ P @ H.T) + self._measurement_var
+            K = (P @ H) / S  # Kalman gain, one per state component [pos, vel]
+            state = np.array([self.pos[axis], self.vel[axis]])
+            residual = float(z) - float(H @ state)
+            state = state + K * residual
+            self._P[axis] = P - np.outer(K, H) @ P
+            self.pos[axis], self.vel[axis] = state
 
 
 # --------------------------------------------------------------------------
@@ -468,7 +586,9 @@ def track_video(video_path, output_csv, annotate_path=None, progress_callback=No
     trails = {i: [] for i in range(n_animals)}
 
     records = []
-    prev_centroids = None
+    prev_centroids = None    # used only for the initial seeding, before Kalman filters exist
+    kalmans = None           # list[CentroidKalman], one per animal, created once seeded
+    frames_since_update = None  # consecutive no-detection frames per animal, for coasting
     stopped_early = False
 
     motion_history = None
@@ -494,24 +614,69 @@ def track_video(video_path, output_csv, annotate_path=None, progress_callback=No
                                   motion_mask=(motion_history.mask if motion_history else None),
                                   debris_motion_fraction=cfg["debris_motion_fraction"])
 
-        if detected is None:
-            curr = prev_centroids if prev_centroids else [(np.nan, np.nan)] * n_animals
-            flag = "lost"
-        elif len(detected) < n_animals:
-            if prev_centroids is None:
-                curr = (detected + [detected[0]])[:n_animals]
+        if kalmans is None:
+            # --- SEEDING: no Kalman filters yet (either this is frame 0,
+            # or nothing confident enough has been seen yet to start
+            # them from) -- same logic this file has always used, purely
+            # matching against the last raw position. ---
+            if detected is None:
+                curr = prev_centroids if prev_centroids else [(np.nan, np.nan)] * n_animals
+                flag = "lost"
+            elif len(detected) < n_animals:
+                if prev_centroids is None:
+                    curr = (detected + [detected[0]])[:n_animals]
+                else:
+                    curr = match_identities(prev_centroids, detected)
+                flag = "partial"
             else:
-                curr = match_identities(prev_centroids, detected)
-            flag = "partial"
-        else:
-            if prev_centroids is None:
-                detected = sorted(detected, key=lambda p: p[0])  # seed left-to-right
-                curr = detected[:n_animals]
-            else:
-                curr = match_identities(prev_centroids, detected)
-            flag = "ok"
+                if prev_centroids is None:
+                    detected = sorted(detected, key=lambda p: p[0])  # seed left-to-right
+                    curr = detected[:n_animals]
+                else:
+                    curr = match_identities(prev_centroids, detected)
+                flag = "ok"
 
-        prev_centroids = curr
+            prev_centroids = curr
+            # Once every animal has a real, non-NaN fix, start a Kalman
+            # filter for each from here on -- see CentroidKalman.
+            if flag == "ok" and not any(np.isnan(c[0]) for c in curr):
+                kalmans = [CentroidKalman(x, y, process_var=cfg["kalman_process_var"],
+                                           measurement_var=cfg["kalman_measurement_var"])
+                           for x, y in curr]
+                frames_since_update = [0] * n_animals
+        else:
+            # --- STEADY STATE: predict each animal's expected position
+            # for THIS frame first (motion-aware -- keeps extrapolating
+            # through an occlusion instead of freezing, unless it's been
+            # coasting too long, see kalman_max_coast_frames), THEN match
+            # detections against that expectation rather than the raw
+            # last-measured position, and only update the filters that
+            # actually got a real detection this round. ---
+            for r in range(n_animals):
+                if frames_since_update[r] > cfg["kalman_max_coast_frames"]:
+                    kalmans[r].vel[:] = 0.0  # stop extrapolating a long-gone animal
+            predicted = [kf.predict() for kf in kalmans]
+
+            if detected is None:
+                curr = predicted
+                matched = set()
+                flag = "lost"
+            elif len(detected) < n_animals:
+                curr, matched = _hungarian_assignment(predicted, detected)
+                flag = "partial"
+            else:
+                curr, matched = _hungarian_assignment(predicted, detected)
+                flag = "ok"
+
+            for r in range(n_animals):
+                if r in matched:
+                    kalmans[r].update(*curr[r])
+                    curr[r] = tuple(kalmans[r].pos)  # report the smoothed (not raw) position
+                    frames_since_update[r] = 0
+                else:
+                    frames_since_update[r] += 1
+
+            prev_centroids = curr
 
         for i, (x, y) in enumerate(curr):
             records.append(dict(
