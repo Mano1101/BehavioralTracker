@@ -13,6 +13,7 @@ under it) is the only thing being rewritten.
 """
 
 import os
+import sys
 import json
 import math
 import glob
@@ -33,8 +34,25 @@ from qt_app.theme import PALETTE, build_stylesheet
 from qt_app.app_settings import load_settings
 from analysis.custom_variables import parse_custom_variables
 
-ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "resources", "icon.png")
+def resource_path(*parts):
+    """Resolve a path inside resources/ that works from source (resources/
+    next to main.py), from any cwd, and from a PyInstaller-frozen build
+    (sys._MEIPASS/resources). The old single fixed path silently missed
+    the icon in frozen builds -- which is why the header badge fell back
+    to the 'B' text and the window showed a generic OS icon."""
+    candidates = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(os.path.join(sys._MEIPASS, "resources", *parts))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(os.path.join(root, "resources", *parts))
+    candidates.append(os.path.join(os.getcwd(), "resources", *parts))
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[-2] if len(candidates) > 1 else candidates[0]
+
+
+ICON_PATH = resource_path("icon.png")
 
 # Setup page's "Stop condition (optional)" combo box labels -> the internal
 # codes tracking.location.process_single_video understands. Shared between
@@ -1091,8 +1109,8 @@ class MainWindow(QMainWindow):
             n_shapes = len(op["shapes"])
             n_pts = len(op["shapes"][-1])
             return (f"Shape {n_shapes} ({n_pts} pts, need 3+). Click to add points, tracing the "
-                    "WHOLE apparatus's own outer outline -- 'New Shape' only if it's split into "
-                    "separate pieces on screen, then Finish to auto-detect and letter its arms/zones.")
+                    "One shape = auto-detect its arms/zones. Multiple shapes (New Shape between parts): "
+                    "each shape becomes one zone A, B, C ... exactly as drawn, then Finish.")
         elif op["kind"] == "distance":
             return f"Click 2 points of known real-world distance ({len(op['points'])}/2 placed)."
         elif op["kind"] == "template_zones":
