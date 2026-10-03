@@ -692,6 +692,18 @@ def detect_apparatus_partitions(outline_shapes, width, height, min_area_fraction
     if not shapes:
         return {}, "Trace the apparatus's outer outline first (click to add points, then Finish)."
 
+    # "Exactly what I draw": when the apparatus is traced as MULTIPLE
+    # shapes (one shape per part, using 'New Shape' between parts), each
+    # traced shape becomes exactly ONE zone, labeled A, B, C ... in the
+    # order drawn. No merging into a single mask, no skeleton
+    # re-interpretation -- the zone geometry IS the traced geometry, so
+    # N traced parts -> N zones. A SINGLE traced shape keeps the skeleton
+    # auto-partition below (trace the whole apparatus once -> its arms
+    # are detected automatically).
+    if len(shapes) > 1:
+        return {_partition_letter(i): [(float(x), float(y)) for x, y in shape]
+                for i, shape in enumerate(shapes)}, None
+
     filled = np.zeros((height, width), dtype=np.uint8)
     for shape in shapes:
         cv2.fillPoly(filled, [np.array(shape, dtype=np.int32)], 255)
