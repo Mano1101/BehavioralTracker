@@ -52,7 +52,7 @@ def build_stylesheet(p=PALETTE):
         background: {p['ACCENT']}; color: white; font-weight: 700;
         font-size: 15px; border-radius: 6px;
     }}
-    QLabel#brandTitle {{ color: white; font-size: 22px; font-weight: 800; }}
+    QLabel#brandTitle {{ color: white; font-size: 17px; font-weight: 800; }}
     QLabel#brandVersion {{
         color: #bcd4f5; background: rgba(255,255,255,0.12);
         border-radius: 9px; font-size: 10px; font-weight: 700; padding: 2px 8px;
@@ -72,18 +72,8 @@ def build_stylesheet(p=PALETTE):
     QWidget#modeRow {{ background: {p['BG']}; }}
 
     QWidget#analysisRow {{ background: {p['BG']}; border-bottom: 1px solid {p['BORDER']}; }}
-    QPushButton#navTile {{
-        background: transparent; color: {p['TEXT_SOFT']}; border: 1px solid transparent;
-        border-radius: 5px; padding: 7px 10px; font-size: 11px; font-weight: 600;
-    }}
-    QPushButton#navTile:hover {{ background: {p['ACCENT_LIGHT']}; color: {p['ACCENT_DARK']}; }}
-    QPushButton#navTileActive {{
-        background: {p['ACCENT_LIGHT']}; color: {p['ACCENT_DARK']};
-        border: 1px solid #c9dcf2; border-left: 4px solid {p['ACCENT']};
-        border-radius: 5px; padding: 7px 8px; font-size: 11px; font-weight: 700;
-    }}
     QPushButton#analysisCard {{
-        font-size: 11.5px; font-weight: 700; border-radius: 6px; padding: 9px 14px;
+        font-size: 11.5px; font-weight: 700; border-radius: 6px; padding: 8px 14px;
         background: {p['CARD_BG']}; color: {p['TEXT']}; border: 1px solid {p['BORDER']};
     }}
     QPushButton#analysisCardActive {{

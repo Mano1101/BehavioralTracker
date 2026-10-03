@@ -253,14 +253,14 @@ class MainWindow(QMainWindow):
         brand_row.setSpacing(10)
         badge = QLabel("B")
         badge.setObjectName("brandBadge")
-        badge.setFixedSize(52, 52)
+        badge.setFixedSize(36, 36)
         badge.setAlignment(Qt.AlignCenter)
         if os.path.exists(ICON_PATH):
             # The icon file already has its own rounded gradient background
             # baked in, so fill the badge with it directly instead of
             # layering it on top of the QSS accent-colored square.
             pix = QPixmap(ICON_PATH).scaled(
-                52, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             badge.setPixmap(pix)
             badge.setStyleSheet("background: transparent; border-radius: 6px;")
         brand_row.addWidget(badge)
@@ -345,7 +345,7 @@ class MainWindow(QMainWindow):
         self.analysis_type_buttons = {}
         at_defs = [
             ("standard", "Standard Tracking", "Single mouse - zones & distance"),
-            ("multi_mouse", "Multi-Mouse", "2-3 mice, ID-matched tracks"),
+            ("multi_mouse", "Multi-Mouse Tracking", "2-3 mice, ID-matched tracks"),
             ("behavior", "Behavior Classification", "Grooming / rearing / locomotion"),
         ]
         for val, text, subtitle in at_defs:
@@ -2157,6 +2157,22 @@ class MainWindow(QMainWindow):
                 batch_df.to_excel(batch_xlsx_path, index=False, engine="openpyxl")
             except Exception as exc:
                 QMessageBox.critical(self, "Save Error", f"Could not save batch summary:\n\n{exc}")
+
+            # Cross-group statistics + comparison charts (EthoVision/ANY-maze
+            # parity): when the batch rows carry a "Group" column (from the
+            # Subject Database) run per-metric tests and export
+            # statistics.csv/.xlsx + one boxplot PNG per metric next to the
+            # batch summary. Fully optional -- silently skipped without a
+            # Group column or with degenerate data.
+            try:
+                from output.graphs import save_group_statistics
+                results_df, stat_paths = save_group_statistics(
+                    batch_df, "Group", folder, input_path=batch_path)
+                if results_df is not None and not results_df.empty:
+                    self.status_label.setText(
+                        f"Batch complete. Group statistics: {stat_paths.get('xlsx', '')}")
+            except Exception as exc:
+                print(f"Group statistics skipped: {exc}")
             self.status_label.setText("Batch complete.")
             msg = (f"Processed {processed_count}/{len(self.videos)} videos.\n\n"
                    f"Batch summary:\n{batch_path}\n{batch_xlsx_path}")
