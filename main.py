@@ -22,13 +22,36 @@ from PySide6.QtWidgets import QApplication
 from qt_app.theme import build_stylesheet, PALETTE
 from qt_app.main_window import MainWindow
 
-ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "icon.png")
+def resource_path(*parts):
+    """resources/ resolution that works from source and frozen builds."""
+    candidates = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(os.path.join(sys._MEIPASS, "resources", *parts))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", *parts))
+    candidates.append(os.path.join(os.getcwd(), "resources", *parts))
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[-2]
+
+
+ICON_PATH = resource_path("icon.png")
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("BehavioralTracker")
     app.setOrganizationName("BehavioralTracker")
+    if sys.platform == "win32":
+        # Without an explicit AppUserModelID Windows groups the window
+        # under python.exe, so the taskbar shows a generic interpreter
+        # icon instead of the app icon.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "BehavioralTracker.app.1")
+        except Exception:
+            pass
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
     # MainWindow.__init__ also applies this same stylesheet; doing it here
