@@ -791,7 +791,7 @@ class SetupPage(QWidget):
     # where every groupbox was stacked and visible at once.
     # ------------------------------------------------------------------
 
-    def _build_operation_master_detail(self, operations, tile_width=250, detail_width=390):
+    def _build_operation_master_detail(self, operations, tile_width=130, detail_width=280):
         """operations: [(key, title, builder_fn), ...]. builder_fn(layout)
         populates a QVBoxLayout with that one operation's own widgets --
         the exact same groupbox-building code the old flat column used,
@@ -836,7 +836,7 @@ class SetupPage(QWidget):
 
         def activate(key):
             for k, b in buttons.items():
-                b.setObjectName("navTileActive" if k == key else "navTile")
+                b.setObjectName("analysisCardActive" if k == key else "toolBtn")
                 b.style().unpolish(b)
                 b.style().polish(b)
             stack.setCurrentIndex(index_of[key])
@@ -847,17 +847,14 @@ class SetupPage(QWidget):
             page_layout.addStretch()
             stack.addWidget(page_scroll)
 
-            b = QPushButton(tile_title.replace("\n", " "))
-            b.setObjectName("navTile")
-            b.setMinimumHeight(42)
-            b.setMinimumWidth(tile_width - 30)
-            b.setStyleSheet("text-align: left; padding-left: 12px;")
+            b = QPushButton(tile_title)
+            b.setObjectName("analysisCardActive" if i == 0 else "toolBtn")
+            b.setMinimumHeight(38)
             b.clicked.connect(lambda checked=False, k=key: activate(k))
             tile_col.addWidget(b)
             buttons[key] = b
         tile_col.addStretch()
-        initial_key = "detection" if "detection" in index_of else operations[0][0]
-        activate(initial_key)
+        stack.setCurrentIndex(0)
 
         row.addWidget(tile_scroll)
         row.addWidget(stack)
@@ -1128,8 +1125,8 @@ class SetupPage(QWidget):
         self.app.progress_label.setStyleSheet(f"color: {PALETTE['MUTED']}; font-size: 9.5px;")
         progress_col.addWidget(self.app.progress_label)
 
-        self.bottom_layout.addLayout(progress_col, 3)
         self.bottom_layout.addLayout(left_cta, 1)
+        self.bottom_layout.addLayout(progress_col, 1)
 
         self.refresh_canvas()
 
@@ -1290,8 +1287,8 @@ class SetupPage(QWidget):
         self.app.progress_label.setStyleSheet(f"color: {PALETTE['MUTED']}; font-size: 9.5px;")
         progress_col.addWidget(self.app.progress_label)
 
-        self.bottom_layout.addLayout(progress_col, 1)
         self.bottom_layout.addLayout(left_cta, 2)
+        self.bottom_layout.addLayout(progress_col, 1)
 
         self.refresh_canvas()
 
