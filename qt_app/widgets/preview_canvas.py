@@ -178,8 +178,12 @@ def draw_overlays(frame_bgr, app):
             cv2.polylines(disp, [arr], True, color, sizes["line"], lineType=cv2.LINE_AA)
             cx = int(np.mean([p[0] for p in pts]))
             cy = int(np.mean([p[1] for p in pts]))
+            # White letter with a black halo so the zone label (A, B, C ...)
+            # stays readable on any video background, not just pale frames.
             cv2.putText(disp, name, (cx - 10, cy), cv2.FONT_HERSHEY_SIMPLEX,
-                        sizes["font_scale"], color, sizes["font_thick"], cv2.LINE_AA)
+                        sizes["font_scale"] * 1.4, (0, 0, 0), sizes["font_thick"] + 3, cv2.LINE_AA)
+            cv2.putText(disp, name, (cx - 10, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                        sizes["font_scale"] * 1.4, (255, 255, 255), sizes["font_thick"] + 1, cv2.LINE_AA)
 
     if app.pending_object_points:
         for i, (name, pts) in enumerate(sorted(app.pending_object_points.items())):
