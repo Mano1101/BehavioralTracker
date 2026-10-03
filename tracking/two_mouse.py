@@ -89,7 +89,14 @@ import cv2
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover -- tqdm is in requirements.txt; fallback keeps engine importable without it
+    def tqdm(iterable=None, **kwargs):
+        """No-op fallback so the tracking engine works without tqdm
+        (e.g. minimal/headless installs and frozen PyInstaller builds
+        where the console progress bar is unwanted anyway)."""
+        return iterable if iterable is not None else iter(())
 
 DEFAULTS = dict(
     n_background_samples=40,   # frames used to build the background model

@@ -21,29 +21,14 @@ from tracking.epm import calculate_arm_entries, calculate_alternation
 from output.csv import write_csv_report
 from output.excel import write_excel_report
 
-# ROI_COLORS/OBJECT_COLORS must be defined BEFORE the output.graphs import
-# below: output/graphs.py imports them back from this module, and since
-# Python runs a module top-to-bottom, they need to already exist on this
-# (still-loading) module by the time that reverse import happens.
-ROI_COLORS = [
-    (0, 255, 0),
-    (0, 165, 255),
-    (255, 0, 255),
-    (255, 255, 0),
-    (0, 255, 255),
-    (255, 0, 0),
-    (180, 105, 255),
-]
+# Color palettes live in tracking/colors.py (shared with output/graphs.py
+# without a circular import -- see that module's docstring).
+from tracking.colors import ROI_COLORS, OBJECT_COLORS  # noqa: F401  (re-exported for existing importers)
 
-OBJECT_COLORS = [
-    (255, 128, 0),
-    (128, 0, 255),
-    (0, 128, 255),
-    (0, 200, 120),
-    (200, 0, 120),
-]
-
-from output.graphs import save_plots, save_zone_occupancy_chart
+from output.graphs import (
+    save_plots, save_zone_occupancy_chart,
+    save_timecourse_plots, save_thigmotaxis_chart,
+)
 
 
 def order_points(pts):
@@ -538,44 +523,126 @@ def _partition_one_blob(comp_mask, offset, min_area_fraction):
         # non-branching shape.
         return _whole_blob_as_one_zone()
 
-    # Seed markers for cv2.watershed: 1 = outside the traced outline
-    # (never grown into), 0 = unassigned (grown into from whichever
-    # numbered seed reaches it first BY SHORTEST PATH THROUGH THE SHAPE,
-    # not a straight line -- watershed on a flat/gradient-less image is
-    # exactly a geodesic-nearest-seed partition, so it correctly follows
+    # Seed markers for cv2.watershed: 0 = unassigned (grown into from
+    # whichever numbered seed reaches it first BY SHORTEST PATH THROUGH THE
+    # SHAPE, not a straight line -- watershed on a flat/gradient-less image
+    # is exactly a geodesic-nearest-seed partition, so it correctly follows
     # a bent or branching corridor instead of jumping across a concave
-    # inner corner the way straight-line nearest-neighbor would), 2.. =
-    # one per arm (+ the junction hub, if it's more than just a crossing
-    # point -- see below).
+    # inner corner the way straight-line nearest-neighbor would), 2.. = one
+    # per arm (+ the junction hub, if it's more than just a crossing point
+    # -- see below).
+    #
+    # Deliberately NOT marking "outside the traced outline" as its own
+    # seed (as an earlier version of this did, with value 1): every arm's
+    # seed is only a thin 1-3px-wide line down its own corridor's centre,
+    # so anywhere within roughly half the corridor's width of a wall, that
+    # wall sits CLOSER (by raw pixel distance) than the arm's own seed
+    # line does. With "outside" competing as a real seed, cv2.watershed's
+    # geodesic nearest-seed metric then handed a wide strip along BOTH
+    # walls of every arm to "outside" instead of to the arm -- shrinking
+    # each zone to little more than a thin central stripe of its true
+    # corridor (confirmed by measuring a cross-section of a symmetric test
+    # corridor: the zone covered under half the traced width). Leaving
+    # "outside" unseeded and relying on the barrier image below (so the
+    # flood never prefers it over a same-cost interior route) instead lets
+    # each arm's seed fill its ENTIRE corridor, wall to wall, contested
+    # only by neighboring arms -- which is the only competition that
+    # should exist.
     markers = np.zeros((ch, cw), dtype=np.int32)
-    markers[comp_mask == 0] = 1
 
     seed_kernel = np.ones((3, 3), dtype=np.uint8)
     next_id = 2
+    arm_marker_id = {}
     for lbl in real_arms:
         arm_mask = (arm_labels == lbl).astype(np.uint8)
         arm_seed = cv2.dilate(arm_mask, seed_kernel) & comp_mask
         markers[arm_seed == 1] = next_id
+        arm_marker_id[lbl] = next_id
         next_id += 1
 
     hub_area_threshold = max(min_area_fraction * comp_area, 1)
-    n_hub_labels, hub_labels, hub_stats, _ = cv2.connectedComponentsWithStats(
+    n_hub_labels, hub_labels, hub_stats, hub_centroids = cv2.connectedComponentsWithStats(
         (junctions_dilated & comp_mask), connectivity=8
     )
+    # How close an arm has to pass by a crossing point to be considered one
+    # of the arms meeting THERE (see the angle-split below) -- generous
+    # relative to the halo itself, since every arm attached to a crossing
+    # gets cut by this exact halo and so naturally ends just outside it.
+    hub_attach_radius = junction_halo_px * 4
     for lbl in range(1, n_hub_labels):
         if hub_stats[lbl, cv2.CC_STAT_AREA] < hub_area_threshold:
-            continue  # just a crossing point -- let the arms split it between them
+            # Just a crossing point, not a hub zone of its own: left for
+            # cv2.watershed's geodesic "nearest seed PIXEL" metric to decide
+            # how the arms split it between them. But every arm's seed was
+            # cut short of this exact spot by junction_halo_px above, so
+            # right here -- where it matters most -- that metric quietly
+            # flips from "distance to a long line" (a clean straight
+            # bisector, exactly what a crossing of 2+ arms should look
+            # like) to "distance to that line's cut-short ENDPOINT" (a
+            # curved/parabolic boundary) for whichever neighboring arm's
+            # seed happens to still be line-like at that point. The result
+            # is boundaries that visibly bulge instead of radiating
+            # straight out of the crossing, even for a perfectly symmetric
+            # hub. Deciding these specific pixels by plain angle around the
+            # crossing's own centroid sidesteps that mismatch entirely --
+            # hard-assign them straight into their nearest-angle arm's seed
+            # here, before cv2.watershed even runs, so there is nothing
+            # left right at the crossing for it to get wrong.
+            hcx, hcy = hub_centroids[lbl]
+            arm_angle = {}
+            for albl in real_arms:
+                ys_a, xs_a = np.where(arm_labels == albl)
+                d2 = (xs_a - hcx) ** 2 + (ys_a - hcy) ** 2
+                near_i = int(np.argmin(d2))
+                if d2[near_i] ** 0.5 > hub_attach_radius:
+                    continue  # this arm isn't one of the ones meeting at this crossing
+                far_i = int(np.argmax(d2))  # the arm's far end sets its outward direction
+                arm_angle[albl] = np.arctan2(ys_a[far_i] - hcy, xs_a[far_i] - hcx)
+
+            crossing_mask = (hub_labels == lbl) & (markers == 0)
+            ys_c, xs_c = np.where(crossing_mask)
+            if ys_c.size and arm_angle:
+                pixel_angle = np.arctan2(ys_c - hcy, xs_c - hcx)
+                arm_ids = list(arm_angle.keys())
+                # Wrapped angular distance from each pixel to each
+                # candidate arm's outward direction (handles the +-pi
+                # wraparound correctly, unlike a plain subtraction).
+                diffs = np.stack(
+                    [np.abs(np.angle(np.exp(1j * (pixel_angle - arm_angle[a])))) for a in arm_ids],
+                    axis=0,
+                )
+                nearest = np.argmin(diffs, axis=0)
+                for k, albl in enumerate(arm_ids):
+                    sel = nearest == k
+                    if np.any(sel):
+                        markers[ys_c[sel], xs_c[sel]] = arm_marker_id[albl]
+            continue  # not promoted to a zone of its own
         hub_seed = (hub_labels == lbl) & (markers == 0)
         if np.any(hub_seed):
             markers[hub_seed] = next_id
             next_id += 1
 
-    flat_bgr = np.zeros((ch, cw, 3), dtype=np.uint8)
-    cv2.watershed(flat_bgr, markers)
+    # The flood-priority image for cv2.watershed: flat (0) everywhere
+    # inside the traced outline, so arm/hub seeds compete there purely by
+    # geodesic pixel distance (see above) -- but a solid high value (255)
+    # OUTSIDE it, well above anything a seed ever produces, so that region
+    # is only ever flooded into AFTER the entire interior is already
+    # spoken for. That keeps "outside" from ever being used as a cheap
+    # detour between two points that are close in raw pixel space but far
+    # apart along the apparatus's actual corridors (e.g. two arm tips that
+    # pass near each other on a tightly folded layout) -- the interior-only
+    # route always wins first, exactly as if "outside" didn't exist until
+    # there's nothing left inside to assign. Whatever label the exterior
+    # eventually ends up with from this trailing, arbitrary flood is
+    # discarded below (every region is intersected back with comp_mask),
+    # so it never matters.
+    barrier_img = np.zeros((ch, cw, 3), dtype=np.uint8)
+    barrier_img[comp_mask == 0] = 255
+    cv2.watershed(barrier_img, markers)
 
     found = []
     for region_id in range(2, next_id):
-        region_mask = (markers == region_id).astype(np.uint8) * 255
+        region_mask = ((markers == region_id) & (comp_mask == 1)).astype(np.uint8) * 255
         pts = _mask_to_polygon(region_mask)
         if pts is None:
             continue
@@ -803,9 +870,28 @@ def wrap_status_line(segments, font, font_scale, thickness, max_width):
         if not sep:
             wrapped.append(line)  # nothing to split on -- draw as-is (rare)
             continue
-        items = rest.split(", ")
+        # Split on the comma but KEEP the comma on every item except the
+        # last, and pack with a plain space: the list punctuates itself,
+        # so no information is lost no matter how the lines break -- and
+        # the result is identical to the input when everything fits on
+        # one line. (Splitting on ", " and joining with ", " consumed
+        # the comma on line breaks; and OpenCV 4.12's font metrics are
+        # slightly wider than the build this was first written against,
+        # which is why this only surfaces now.)
+        parts = [p.strip() for p in rest.split(",")]
+        items = [p + "," for p in parts[:-1]] + parts[-1:]
         items[0] = f"{label}: {items[0]}"
-        wrapped.extend(_pack_segments(items, ", ", font, font_scale, thickness, max_width))
+        # Word-level fallback: a single comma-item (usually the first one,
+        # carrying its "Label:" prefix) can still exceed max_width -- split
+        # it at spaces so every emitted line fits, no matter the OpenCV
+        # version's font metrics or how long zone names get.
+        final_items = []
+        for it in items:
+            if cv2.getTextSize(it, font, font_scale, thickness)[0][0] <= max_width:
+                final_items.append(it)
+            else:
+                final_items.extend(it.split(" "))
+        wrapped.extend(_pack_segments(final_items, " ", font, font_scale, thickness, max_width))
     return wrapped
 
 
@@ -1842,6 +1928,24 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
             summary["Custom_variables_warnings"] = custom_var_warnings
 
     # -----------------------------------------
+    # Thigmotaxis (open-field border/center occupancy) -- computed BEFORE
+    # the Summary sheet is written so its columns land in the Excel/CSV
+    # output. Border margin defaults to 10% of the smaller arena side;
+    # override with setup["thigmotaxis_margin_px"], disable with 0.
+    # -----------------------------------------
+    thig_margin = setup.get("thigmotaxis_margin_px")
+    if thig_margin is None:
+        thig_margin = int(round(min(warp_w, warp_h) * 0.10))
+    if thig_margin and int(thig_margin) > 0:
+        try:
+            from analysis.thigmotaxis import thigmotaxis_metrics, flatten_for_summary
+            thig = thigmotaxis_metrics(df, warp_w, warp_h, int(thig_margin), fps)
+            summary.update(flatten_for_summary(thig))
+            save_thigmotaxis_chart(thig, output_dir)
+        except Exception as exc:
+            print(f"Thigmotaxis analysis skipped: {exc}")
+
+    # -----------------------------------------
     # Output files -- see output/csv.py, output/excel.py, output/graphs.py
     # -----------------------------------------
 
@@ -1865,6 +1969,16 @@ def process_single_video(video_path, setup, show_display=True, progress_callback
     save_plots(df, output_dir, roi_points, object_points, warp_w, warp_h, background=background,
                x_col=traj_x_col, y_col=traj_y_col)
     save_zone_occupancy_chart(summary, roi_names, output_dir)
+
+    # Distance/speed time-course charts (EthoVision/ANY-maze parity) --
+    # plotted from the same possibly-smoothed trajectory columns the
+    # trajectory chart uses.
+    try:
+        save_timecourse_plots(df, fps, output_dir,
+                              scale_factor=setup.get("scale_factor"),
+                              x_col=traj_x_col, y_col=traj_y_col)
+    except Exception as exc:
+        print(f"Time-course plots skipped: {exc}")
 
     # -----------------------------------------
     # Final report
