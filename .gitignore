@@ -1,0 +1,16 @@
+# Build output (made by the GitHub build; never commit it)
+__pycache__/
+*.pyc
+installer/build/
+installer/Output/
+packaging/build/
+packaging/dist/
+
+# NEVER in this repository: the licence generator, your private signing key, issued licences
+protect/keygen.py
+protect/Generate_Licence.bat
+protect/keys/private.pem
+protect/keys/private.pem.new
+protect/issued/
+LicenceTools/
+*.key
