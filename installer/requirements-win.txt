@@ -1,0 +1,30 @@
+# Exact Windows package set of BehavioralTracker 1.0.0 (tested together).
+# Used by the Setup: bundled in the offline Setup, downloaded by the online Setup.
+PySide6-Essentials==6.11.2
+shiboken6==6.11.2
+opencv-python==5.0.0.93
+numpy==2.5.3
+pandas==3.0.6
+tzdata==2026.5
+matplotlib==3.11.2
+openpyxl==3.1.5
+scipy==1.18.1
+statsmodels==0.15.0
+cryptography==50.0.2
+cv2-enumerate-cameras==1.4.0
+contourpy==1.4.0
+cycler==0.12.1
+et-xmlfile==2.0.0
+fonttools==4.66.1
+formulaic==1.2.2
+interface-meta==2.0.1
+kiwisolver==1.5.1
+narwhals==2.27.0
+packaging==26.3
+patsy==1.0.3
+pillow==12.3.0
+pyparsing==3.3.3
+python-dateutil==2.9.0.post0
+six==1.17.0
+typing-extensions==4.16.0
+wrapt==2.5.0
