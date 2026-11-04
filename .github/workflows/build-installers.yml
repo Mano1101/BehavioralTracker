@@ -1,1 +1,77 @@
+# Builds the ONLINE installers of BehavioralTracker on GitHub. Nothing offline is made or stored here:
+#   Windows  BehavioralTracker_Setup_<version>_<edition>.exe       downloads the Python packages while installing
+#   Linux    BehavioralTracker_Setup_<version>_linux[_licensed].run  downloads Python + packages while installing
+#   macOS    BehavioralTracker_Setup_<version>_mac[_licensed].zip    downloads Python + packages while installing
+# Edition: "licensed" when this repository has the _license folder, otherwise "unlicensed".
+# Start it: Actions -> "Build installers (online)" -> Run workflow.  A pushed tag v* also makes a GitHub Release.
+# Needs no secrets: the licensed edition uses only protect/keys/public.pem (the licence generator and the private
+# key never belong in this repository).
+name: Build installers (online)
 
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"        # must be 3.12: the protected app is Python 3.12 bytecode
+
+      - name: Edition
+        run: |
+          if [ -d _license ]; then echo "EDITION=licensed" >> "$GITHUB_ENV"; else echo "EDITION=unlicensed" >> "$GITHUB_ENV"; fi
+
+      - name: Build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nsis mingw-w64 zip xvfb fonts-dejavu-core
+          # libraries every desktop Linux has (GitHub's computer is a server): needed by the app test only
+          sudo apt-get install -y -q libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+          python -m pip install -q --disable-pip-version-check cryptography Pillow
+
+      - name: Windows Setup (online)
+        run: KINDS="$EDITION" PYSECURE=python bash installer/build_installer.sh online
+
+      - name: Linux and macOS installers (online)
+        run: EDITIONS="$EDITION" ONLINE_ONLY=1 PYSECURE=python bash installer/build_unix_installers.sh
+
+      - name: Test - install the Linux file (downloads its packages) and start the app
+        run: |
+          export HOME="$RUNNER_TEMP/testhome"; mkdir -p "$HOME"
+          bash installer/Output/BehavioralTracker_Setup_*_linux*.run < /dev/null
+          APP="$HOME/.local/share/BehavioralTracker/BehavioralTracker"
+          xvfb-run -a "$APP" > "$RUNNER_TEMP/app.log" 2>&1 &
+          PID=$!
+          sleep 45
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "The app is running - OK"
+            kill "$PID"; pkill -f main_pro.py || true
+          else
+            echo "The app stopped:"; cat "$RUNNER_TEMP/app.log"; cat "$HOME/.behavioraltracker/install.log" || true
+            exit 1
+          fi
+
+      - name: Files
+        run: ls -la installer/Output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BehavioralTracker-installers-${{ env.EDITION }}
+          path: installer/Output/*
+          retention-days: 30
+
+      - name: GitHub Release (only for a v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/Output/*
